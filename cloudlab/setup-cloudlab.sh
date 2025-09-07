@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CloudLab setup script: Mininet + OVS + tools + Python venv with pinned ryu/eventlet
-# This avoids the eventlet>=0.31 'ALREADY_HANDLED' import error with Ryu.
+# Also pins setuptools<66 and pip<24 to avoid Ryu build issues with easy_install removal.
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ else
   echo "==> Mininet already present at /opt/mininet (skipping clone)"
 fi
 
-# ---------- Python venv with pinned Ryu/eventlet ----------
+# ---------- Python venv with pinned toolchain & Ryu/eventlet ----------
 if [ ! -d "${VENV}" ]; then
   echo "==> Creating Python venv at ${VENV}"
   python3 -m venv "${VENV}"
@@ -37,17 +37,18 @@ else
   echo "==> Using existing venv at ${VENV}"
 fi
 
-echo "==> Upgrading pip in venv and installing pinned packages"
-"${VENV}/bin/pip" install --upgrade pip
-# Pin a Ryu version that still expects eventlet.wsgi.ALREADY_HANDLED and a compatible eventlet
+echo "==> Upgrading pip/wheel and pinning setuptools & pip for Ryu build compatibility"
+"${VENV}/bin/pip" install --upgrade 'pip<24' wheel
+"${VENV}/bin/pip" install --upgrade 'setuptools<66'
+
+echo "==> Installing pinned packages (ryu==4.34, eventlet==0.30.2)"
 "${VENV}/bin/pip" install 'ryu==4.34' 'eventlet==0.30.2'
 
 # Optional: show that ALREADY_HANDLED exists
 echo "==> Verifying eventlet.wsgi.ALREADY_HANDLED symbol"
 "${VENV}/bin/python" - <<'PY'
 from eventlet import wsgi
-ok = hasattr(wsgi, "ALREADY_HANDLED")
-print(f"ALREADY_HANDLED present: {ok}")
+print("ALREADY_HANDLED present:", hasattr(wsgi, "ALREADY_HANDLED"))
 PY
 
 cat <<'EONOTES'
@@ -71,8 +72,7 @@ USAGE:
        sudo mn -c
 
 Notes:
-  - The script does NOT install Ryu globally; it is isolated in the venv to avoid
-    conflicts with system packages.
+  - Ryu & dependencies are isolated in the venv. System Python remains untouched.
   - If you use a Makefile, point your 'ryu' target to:
        ${REPO_ROOT}/.venv/bin/ryu-manager cloudlab/ryu/agent_controller.py
 ======================================================================
