@@ -41,8 +41,8 @@ echo "==> Upgrading pip/wheel and pinning setuptools & pip for Ryu build compati
 "${VENV}/bin/pip" install --upgrade 'pip<24' wheel
 "${VENV}/bin/pip" install --upgrade 'setuptools<66'
 
-echo "==> Installing pinned packages (ryu==4.34, eventlet==0.30.2)"
-"${VENV}/bin/pip" install 'ryu==4.34' 'eventlet==0.30.2'
+echo "==> Installing pinned packages (ryu==4.34, eventlet==0.33.3)"
+"${VENV}/bin/pip" install 'ryu==4.34' 'eventlet==0.30.3'
 
 # Optional: show that ALREADY_HANDLED exists
 echo "==> Verifying eventlet.wsgi.ALREADY_HANDLED symbol"
