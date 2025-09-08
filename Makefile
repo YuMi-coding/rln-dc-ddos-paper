@@ -6,9 +6,9 @@ SESSION := ryu
 
 # One-shot environment setup (Mininet/OVS + venv + pinned deps)
 setup:
-	bash cloudlab/setup-cloudlab.sh
+	@bash cloudlab/setup-cloudlab.sh
 
-# Start Ryu controller in a tmux session (idempotent)
+# Start Ryu controller in a tmux session (idempotent; verifies session stays up)
 ryu:
 	@command -v tmux >/dev/null 2>&1 || (echo "tmux not found; install it or run 'make ryu-fg'"; exit 1)
 	@test -x $(RYU_RUN) || (echo "ERROR: $(RYU_RUN) not found or not executable. Re-run 'make setup'."; exit 1)
@@ -17,9 +17,15 @@ ryu:
 		echo "Attach:  tmux attach -t $(SESSION)  |  Restart:  make ryu-restart"; \
 	else \
 		tmux new-session -d -s $(SESSION) '$(RYU_RUN)'; \
-		echo "✓ Ryu started in tmux session '$(SESSION)'."; \
-		echo "Attach:  tmux attach -t $(SESSION)"; \
-		echo "Detach:  Ctrl-b d"; \
+		sleep 1; \
+		if tmux has-session -t $(SESSION) 2>/dev/null; then \
+			echo "✓ Ryu started in tmux session '$(SESSION)'."; \
+			echo "  Attach:  tmux attach -t $(SESSION)"; \
+			echo "  Detach:  Ctrl-b d"; \
+		else \
+			echo "✗ Ryu failed to start. Try 'make ryu-fg' to see errors."; \
+			exit 1; \
+		fi \
 	fi
 
 # Stop the tmux session if running
