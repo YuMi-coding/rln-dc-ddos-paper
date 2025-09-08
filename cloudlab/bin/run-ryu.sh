@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Helper to run Ryu from the local venv with greendns disabled.
-# FIX: repo root is two levels above this script (cloudlab/bin -> repo root).
+# Helper to run Ryu from the local venv with greendns disabled and
+# a pre-start monkey patch for eventlet.wsgi.ALREADY_HANDLED.
 
 set -euo pipefail
 
@@ -9,18 +9,17 @@ DIR="$( cd "$( dirname "$THIS" )" >/dev/null 2>&1 && pwd )"
 ROOT="$( cd "${DIR}/../.." >/dev/null 2>&1 && pwd )"
 
 VENV_BIN="${ROOT}/.venv/bin"
-RYU_APP="${ROOT}/cloudlab/ryu/agent_controller.py"
+LAUNCHER="${ROOT}/cloudlab/bin/launch_ryu.py"
 
-if [[ ! -x "${VENV_BIN}/ryu-manager" ]]; then
-  echo "ERROR: ${VENV_BIN}/ryu-manager not found."
-  echo "Hint: run 'make setup' (or 'bash cloudlab/setup-cloudlab.sh') to create the venv and install Ryu."
+if [[ ! -x "${VENV_BIN}/python" ]]; then
+  echo "ERROR: ${VENV_BIN}/python not found. Run 'make setup' first."
   exit 127
 fi
 
-if [[ ! -f "${RYU_APP}" ]]; then
-  echo "ERROR: Ryu app not found at ${RYU_APP}."
+if [[ ! -f "${LAUNCHER}" ]]; then
+  echo "ERROR: launcher not found at ${LAUNCHER}."
   exit 127
 fi
 
-export EVENTLET_NO_GREENDNS=yes
-exec "${VENV_BIN}/ryu-manager" "${RYU_APP}"
+# Pass through any args (e.g., alternate apps)
+exec "${VENV_BIN}/python" "${LAUNCHER}" "$@"
