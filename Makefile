@@ -48,8 +48,8 @@ ryu-status:
 tree:
 	@echo "==> Cleaning Mininet state (ok if it errors)"
 	- sudo mn -c
-	@echo "==> Starting topology"
-	sudo python3 cloudlab/topos/tree_topo.py
+	@echo "==> Starting topology (preserving X11 env)"
+	sudo DISPLAY=$(DISPLAY) XAUTHORITY=$(XAUTHORITY) python3 cloudlab/topos/tree_topo.py
 
 clean:
 	- tmux kill-session -t $(SESSION)
