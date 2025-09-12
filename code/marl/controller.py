@@ -1,5 +1,5 @@
 from contextlib import closing
-#import cPickle as pickle
+#import pickle as pickle
 import pickle
 import socket
 import struct

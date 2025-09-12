@@ -1,6 +1,6 @@
 from marl import *
 from writer import writeResults, makeResultsAverage
-import cPickle
+import pickle
 import sys
 
 state = ([], None)
@@ -12,7 +12,7 @@ should_read = bool(int(sys.argv[4]))
 
 if should_read:
 	with open(filedir, "rb") as infile:
-		state = cPickle.load(infile)
+		state = pickle.load(infile)
 
 (store_sarsas, random_state) = state
 
@@ -50,5 +50,5 @@ results = marlExperiment(
 writeResults("../../results/offline.csv", results, append=True)
 
 with open(filedir, "wb") as outfile:
-	cPickle.dump((store_sarsas, random_state), outfile)
+	pickle.dump((store_sarsas, random_state), outfile)
 

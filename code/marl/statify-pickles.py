@@ -1,5 +1,5 @@
 from collections import Counter
-import cPickle as pickle
+import pickle as pickle
 import csv
 import numpy as np
 

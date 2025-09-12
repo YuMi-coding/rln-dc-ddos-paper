@@ -1,4 +1,4 @@
-import cPickle
+import pickle
 from marl import *
 import sys
 from writer import writeResults, makeResultsAverage
@@ -137,5 +137,5 @@ if __name__ == "__main__":
 	writeResults(csv_dir, results)
 	makeResultsAverage(csv_dir, avg_csv_dir)
 	with open(sarsas_dir, "wb") as f:
-		cPickle.dump(store_sarsas, f)
+		pickle.dump(store_sarsas, f)
 	print "would write to: {}".format(csv_dir)

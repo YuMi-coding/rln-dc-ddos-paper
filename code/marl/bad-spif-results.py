@@ -1,4 +1,4 @@
-import cPickle
+import pickle
 from marl import *
 import sys
 from writer import writeResults, makeResultsAverage

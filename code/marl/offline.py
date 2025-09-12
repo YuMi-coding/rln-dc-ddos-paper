@@ -1,7 +1,7 @@
 from marl import *
 from writer import writeResults, makeResultsAverage, lastTimestepsAndEpAverages
 import subprocess
-import cPickle
+import pickle
 
 pickle_name = "../../results/offline.pkl"
 total_eps = 10000#0

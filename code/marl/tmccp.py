@@ -1,4 +1,4 @@
-import cPickle
+import pickle
 from marl import *
 import sys
 from writer import writeResults, makeResultsAverage
@@ -81,7 +81,7 @@ if __name__ == "__main__":
 
 	if in_progress:
 		with open(in_progress_file_dir, "rb") as of:
-			(start_i, result_sets, things_to_pickle) = cPickle.load(of)
+			(start_i, result_sets, things_to_pickle) = pickle.load(of)
 
 	things_to_pickle = []
 
@@ -111,12 +111,12 @@ if __name__ == "__main__":
 	# what to do if still work to do? give up.
 	if start_i < n_episodes:
 		with open(in_progress_file_dir, "wb") as of:
-			cPickle.dump((start_i, result_sets, things_to_pickle), of)
+			pickle.dump((start_i, result_sets, things_to_pickle), of)
 		sys.exit(0)
 
 	# Now, save out the sarsas.
 	with open(file_dir, "wb") as outfile:
-		cPickle.dump(things_to_pickle, outfile)
+		pickle.dump(things_to_pickle, outfile)
 
 	# Now, write out the results!
 	for ((rs, gs, ls), out_name) in zip(result_sets, out_names):

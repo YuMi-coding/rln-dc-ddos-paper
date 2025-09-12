@@ -1,4 +1,4 @@
-import cPickle
+import pickle
 from marl import *
 from writer import writeResults, makeResultsAverage
 
@@ -95,7 +95,7 @@ if __name__ == "__main__":
 
 	# Now, save out the sarsas.
 	with open(file_dir, "wb") as outfile:
-		cPickle.dump(things_to_pickle, outfile)
+		pickle.dump(things_to_pickle, outfile)
 
 	# Now, write out the results!
 	for ((rs, gs, ls), out_name) in zip(result_sets, out_names):

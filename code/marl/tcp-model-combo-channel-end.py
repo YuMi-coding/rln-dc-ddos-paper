@@ -1,4 +1,4 @@
-import cPickle
+import pickle
 from marl import *
 import sys
 from writer import writeResults, makeResultsAverage
@@ -65,7 +65,7 @@ if __name__ == "__main__":
 	file_dir = ft.file_dir.format(hosts_p)
 
 	with open(file_dir, "rb") as of:
-		data = cPickle.load(of)
+		data = pickle.load(of)
 
 	for (randstate, contributors) in data:
 		g_contrib = (contributors[0][0], [a for a in xrange(4)])
