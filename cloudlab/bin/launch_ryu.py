@@ -15,12 +15,36 @@ except Exception:
 
 from ryu.cmd import manager
 
-# Default to the repo's agent_controller if no app args provided
-if len(sys.argv) <= 1:
+def repo_root():
     here = os.path.dirname(os.path.abspath(__file__))
-    default_app = os.path.normpath(os.path.join(here, "..", "ryu", "agent_controller.py"))
-    sys.argv = ["ryu-manager", default_app]
-else:
-    sys.argv = ["ryu-manager"] + sys.argv[1:]
+    return os.path.normpath(os.path.join(here, "..", ".."))
 
-manager.main()
+def default_app_path():
+    # Default to the Python3 controller you placed under code/marl/
+    return os.path.join(repo_root(), "code", "marl", "controller_py3.py")
+
+def resolve_app_path(p):
+    if not p:
+        return default_app_path()
+    if os.path.isabs(p):
+        return p
+    return os.path.normpath(os.path.join(repo_root(), p))
+
+def main():
+    # Priority: CLI arg(s) > env RYU_APP > default
+    # If CLI args present and first is a file, treat that as app path
+    app_path = os.environ.get("RYU_APP", "")
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        app_path = sys.argv[1]
+
+    app_path = resolve_app_path(app_path)
+    if not os.path.exists(app_path):
+        sys.stderr.write(f"ERROR: Ryu app not found: {app_path}\n")
+        sys.exit(2)
+
+    # Rebuild argv for ryu-manager
+    sys.argv = ["ryu-manager", app_path] + sys.argv[2:]
+    manager.main()
+
+if __name__ == "__main__":
+    main()

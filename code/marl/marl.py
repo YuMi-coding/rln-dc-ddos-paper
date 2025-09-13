@@ -65,7 +65,7 @@ def marlExperiment(
 		separate_episodes = False,
 
 		max_bw = None,
-		pdrop_magnitudes = [0.1*n for n in range(10)],
+		pdrop_magnitudes = [0.1*n for n in xrange(10)],
 
 		alpha = 0.05,
 		epsilon = 0.3,
@@ -297,11 +297,11 @@ def marlExperiment(
 			# lerp between some observations at differing n
 			pt = float(max(0, ub - 2)) / 14.0
 			divisor = 0.6 + pt * (0.45 - 0.6)
-			print("rescaled to", divisor)
+			print "rescaled to", divisor
 		flow_bw = 52.39456 / (divisor * 1024.0) # to mbps.
 		subclient_count = int(math.ceil(max(1.0, bw / flow_bw)))
 		total_thing[0] += flow_bw * subclient_count
-		print(subclient_count, total_thing)
+		print subclient_count, total_thing
 
 		return [
 			"../opus-voip-traffic/target/release/opus-voip-traffic",
@@ -375,7 +375,7 @@ def marlExperiment(
 		if not split_codings:
 			sarsaParams["tc_indices"] = [np.arange(sarsaParams["vec_size"])]
 		else:
-			sarsaParams["tc_indices"] = [np.arange(4)] + [[i] for i in range(4, sarsaParams["vec_size"])]
+			sarsaParams["tc_indices"] = [np.arange(4)] + [[i] for i in xrange(4, sarsaParams["vec_size"])]
 
 			# Okay, index of last_action is 2 after the last global datum in the feature vector.
 			# combine_with_last_action, strip_last_action, use_path_measurements

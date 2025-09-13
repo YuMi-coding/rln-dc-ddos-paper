@@ -38,7 +38,7 @@ echo "==> Upgrading toolchain in venv"
 "${VENV}/bin/pip" install --upgrade 'setuptools<66'
 
 echo "==> Installing Ryu + compatible deps"
-"${VENV}/bin/pip" install 'ryu==4.34' 'eventlet==0.33.3' 'dnspython>=2.4.2'
+"${VENV}/bin/pip" install 'ryu==4.34' 'eventlet==0.33.3' 'dnspython>=2.4.2' 'networkx==2.8.8' 'numpy==1.23.5' 'scipy==1.9.3' 'matplotlib==3.5.2'
 
 cat <<'EONOTES'
 

@@ -21,5 +21,9 @@ if [[ ! -f "${LAUNCHER}" ]]; then
   exit 127
 fi
 
-# Pass through any args (e.g., alternate apps)
+# Optional: RYU_APP can be an absolute or repo-relative path to the controller app.
+# If unset, the launcher will pick a sane default.
+export RYU_APP="${RYU_APP:-}"
+
+# Pass through any extra args (e.g., alternate Ryu apps, ryu flags)
 exec "${VENV_BIN}/python" "${LAUNCHER}" "$@"
