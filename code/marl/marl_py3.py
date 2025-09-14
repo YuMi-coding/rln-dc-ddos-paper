@@ -1305,9 +1305,9 @@ def marlExperiment(
                     if os.path.exists(traffic_host_bin):
                         cmd = th_cmd(dests, bw, target_ip=target_ip)
                     else:
-                        # Fallback: simple wget loop (quiet, continuous)
+                        # Fallback: simple wget loop
                         cmd = ["bash", "-lc",
-                            f"while true; do wget -q -O /dev/null http://{target_ip}/; sleep 0.2; done"]
+                            f"while true; do wget -q -O /dev/null http://{target_ip}/big.bin || true; sleep 0.2; done"]
                 elif sm == "opus-voip" and good:
                     cmd = opus_cmd(dests, bw, host, target_ip=target_ip)
                 elif sm == "udp-flood" or ((sm is None or sm == "opus-voip") and not good):
@@ -1701,11 +1701,11 @@ def marlExperiment(
 
         print("good:", last_traffic_ratio, ", g_reward:", g_reward, ", selected:", reward)
 
-        # --- ADDED: optional post-run Mininet CLI ---
-        if interactive_cli_post:
-            print("[INFO] Post-run Mininet CLI. Inspect results, then 'exit' to clean up.")
+        # Only drop into CLI after the very last episode
+        is_last_episode = (ep == episodes - 1)
+        if interactive_cli_post and is_last_episode:
+            print("[INFO] Final post-run Mininet CLI (after last episode). 'exit' to clean up.")
             CLI(net)
-
         mon_cmd.stdin.close()
 
         if bw_sock is not None:
