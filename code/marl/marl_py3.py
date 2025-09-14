@@ -1257,15 +1257,34 @@ def marlExperiment(
                     sms = [submodel]
                 else:
                     sms = [m["submodel"] for (p, m) in mix_model]
-                for sm in sms:
-                    if sm is None:
-                        fname = "temp{}.conf".format(i)
-                        with open("../traffic-host/"+fname, "w") as f:
-                            f.write("events { worker_connections 1024; }\nhttp {\n\tserver {\n\t\tinclude global.conf;\n\t\tlisten {}:80;\n\t}\n}\n".format(dest_node[0][0]))
-                        cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
-                    elif submodel == "opus-voip":
-                        cmd = ["../opus-voip-traffic/target/release/opus-voip-traffic", "--server"]
-                    cmds.append(cmd)
+            for sm in sms:
+                if sm in (None, "http"):
+                    fname = f"temp{i}.conf"
+                    with open("../traffic-host/" + fname, "w") as f:
+                        f.write(
+                            "events { worker_connections 1024; }\n"
+                            "http {\n"
+                            f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
+                            "}\n"
+                        )
+                    cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
+
+                elif sm == "opus-voip":   # <<< was `submodel == "opus-voip"`
+                    cmd = ["../opus-voip-traffic/target/release/opus-voip-traffic", "--server"]
+
+                else:
+                    # default to nginx/http if unknown submodel to avoid UnboundLocalError
+                    fname = f"temp{i}.conf"
+                    with open("../traffic-host/" + fname, "w") as f:
+                        f.write(
+                            "events { worker_connections 1024; }\n"
+                            "http {\n"
+                            f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
+                            "}\n"
+                        )
+                    cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
+
+                cmds.append(cmd)
                 for cmd in cmds:
                     server_procs.append(dest.popen(cmd, stdin=PIPE, stderr=sys.stderr))
 
@@ -1282,7 +1301,13 @@ def marlExperiment(
                 ] + ([] if old_style else ["-M", str(bw)]) + [(good_file if good else bad_file)]
             elif model == "nginx":
                 if sm == "http" or (sm is None and good):
-                    cmd = th_cmd(dests, bw, target_ip=target_ip)
+                    traffic_host_bin = "../traffic-host/target/release/traffic-host"
+                    if os.path.exists(traffic_host_bin):
+                        cmd = th_cmd(dests, bw, target_ip=target_ip)
+                    else:
+                        # Fallback: simple wget loop (quiet, continuous)
+                        cmd = ["bash", "-lc",
+                            f"while true; do wget -q -O /dev/null http://{target_ip}/; sleep 0.2; done"]
                 elif sm == "opus-voip" and good:
                     cmd = opus_cmd(dests, bw, host, target_ip=target_ip)
                 elif sm == "udp-flood" or ((sm is None or sm == "opus-voip") and not good):
@@ -1725,6 +1750,8 @@ if __name__ == "__main__":
     cli_post = args.cli in ("post", "both")
 
     marlExperiment(
+        model = "nginx",
+        submodel="http",
         episodes=args.episodes,
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,

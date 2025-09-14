@@ -7,13 +7,14 @@ RYU_RUN  := cloudlab/bin/run-ryu.sh
 SESSION  := ryu
 SHELL := /bin/bash
 SYS_SITE := $(shell python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+PYV := $(shell python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
 
 
 # NEW: app/scripts we want to run
 RYU_APP  := code/marl/controller_py3.py
 MARL_DIR := code/marl
 MARL_APP := marl_py3.py
-MARL_ARGS ?=           # you can override on the CLI, e.g.: MARL_ARGS='--episodes 1'
+MARL_ARGS ?= --episodes 400 --episode-length 200 --cli post           # you can override on the CLI, e.g.: MARL_ARGS='--episodes 1'
 
 setup:
 	bash cloudlab/setup-cloudlab.sh
@@ -107,9 +108,10 @@ tree:
 marl:
 	@echo "==> Cleaning Mininet state (ok if it errors)"
 	- sudo mn -c
-	@echo "==> Running MARL experiment (code/marl/marl_py3.py) with venv Python: $(VENV_PY)"
-	cd $(MARL_DIR) && sudo -E env PYTHONPATH="$(SYS_SITE):$$PYTHONPATH" \
-		$(abspath $(VENV_PY)) $(MARL_APP) $(MARL_ARGS)
+	@echo "==> Running MARL experiment ($(MARL_DIR)/$(MARL_APP)) with venv Python: $(VENV_PY)"
+	cd $(MARL_DIR) && sudo -E env PYTHONUNBUFFERED=1 \
+		PYTHONPATH="$(SYS_SITE):/usr/local/lib/python$(PYV)/dist-packages:$$PYTHONPATH" \
+		$(abspath $(VENV_PY)) -u $(MARL_APP) $(MARL_ARGS)
 
 clean:
 	- tmux kill-session -t $(SESSION)
