@@ -38,6 +38,8 @@ from spf_py3 import *  # SpfMachine, MarlMachine, etc.
 # -------------------------------------------------------------------
 controller_build_port = 6666
 stats_port = 9932
+external_controller = True
+ctl_proc = None
 
 # -------------------------
 # JSON bridge to controller
@@ -1018,7 +1020,23 @@ def marlExperiment(
 
         ctl_proc = None
         if use_controller:
-            ctl_proc = Popen(["ryu-manager", "controller.py"], stdin=PIPE, stderr=sys.stderr)
+            # ctl_proc = Popen(["ryu-manager", "controller_py3.py"], stdin=PIPE, stderr=sys.stderr)
+            py = sys.executable
+            env = os.environ.copy()
+            # keep child isolated from system site-packages
+            env.pop("PYTHONPATH", None)
+            env.pop("PYTHONHOME", None)
+            env["PYTHONNOUSERSITE"] = "1"
+
+            ctl_proc = Popen(
+                [py, "-u", os.path.join(os.path.dirname(__file__), "ryu_bootstrap.py"), "controller_py3.py"],
+                stdin=PIPE,
+                stderr=sys.stderr,
+                env=env,
+            )
+            time.sleep(1.0)  # small grace for OVS to connect
+
+
             apsp = dict(nx.all_pairs_shortest_path(graph))
 
             ips = []
@@ -1752,6 +1770,7 @@ if __name__ == "__main__":
     marlExperiment(
         model = "nginx",
         submodel="http",
+        use_controller=True,
         episodes=args.episodes,
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,

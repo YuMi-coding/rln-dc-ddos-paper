@@ -14,11 +14,20 @@ PYV := $(shell python3 -c 'import sys; print(".".join(map(str, sys.version_info[
 RYU_APP  := code/marl/controller_py3.py
 MARL_DIR := code/marl
 MARL_APP := marl_py3.py
-MARL_ARGS ?= --episodes 400 --episode-length 200 --cli post           # you can override on the CLI, e.g.: MARL_ARGS='--episodes 1'
+MARL_ARGS ?= --episodes 1 --episode-length 200 --cli post           # you can override on the CLI, e.g.: MARL_ARGS='--episodes 1'
 
 setup:
 	bash cloudlab/setup-cloudlab.sh
 	@chmod +x $(RYU_RUN) cloudlab/bin/launch_ryu.py || true
+	@echo "==> Preparing traffic-host files"
+	mkdir -p code/traffic-host/html
+	# generate a 10 MB dummy file if not already there
+	@if [ ! -f code/traffic-host/html/big.bin ]; then \
+		dd if=/dev/zero of=code/traffic-host/html/big.bin bs=1M count=10; \
+		echo "✓ Created code/traffic-host/html/big.bin (10 MB)"; \
+	else \
+		echo "✓ big.bin already exists"; \
+	fi
 	@echo "==> Enabling X11 for root (so xterm works from Mininet)..."
 	@if [[ -n "$$DISPLAY" ]]; then \
 		COOKIE_TMP="$$(mktemp)"; trap 'rm -f "$$COOKIE_TMP"' EXIT; \

@@ -1,3 +1,13 @@
+# --- eventlet compatibility shim (for Ryu's WSGI) ---
+try:
+    import eventlet.wsgi as _wsgi
+    # Older Ryu expects eventlet.wsgi.ALREADY_HANDLED; newer eventlet removed it
+    if not hasattr(_wsgi, "ALREADY_HANDLED"):
+        _wsgi.ALREADY_HANDLED = object()
+except Exception:
+    pass
+# ----------------------------------------------------
+
 # controller.py
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -57,24 +67,60 @@ class RLNController(app_manager.RyuApp):
                                             in_port=msg.match.get('in_port', ofp.OFPP_CONTROLLER),
                                             actions=actions, data=msg.data))
 
+    # def _bootstrap_listener(self):
+    #     # same as your code: accept pickle once
+    #     s = socket.socket()
+    #     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    #     s.bind(("127.0.0.1", BUILD_PORT))
+    #     s.listen(1)
+    #     conn, _ = s.accept()
+    #     try:
+    #         # read length (uint64) then blob
+    #         length = struct.unpack("!Q", conn.recv(8))[0]
+    #         buf = b""
+    #         while len(buf) < length:
+    #             buf += conn.recv(min(65536, length-len(buf)))
+    #         (self.entry_map, self.escape_map, self.inner_host_macs,
+    #          self.prevent_smart, self.port_dest_map) = pickle.loads(buf)
+    #     finally:
+    #         conn.close()
+    #         s.close()
+
     def _bootstrap_listener(self):
-        # same as your code: accept pickle once
+        import time
         s = socket.socket()
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", BUILD_PORT))
-        s.listen(1)
-        conn, _ = s.accept()
+
+        # Try to connect to MARL’s bootstrap server (which binds 127.0.0.1:6666)
+        while True:
+            try:
+                s.connect(("127.0.0.1", BUILD_PORT))
+                break
+            except Exception:
+                time.sleep(0.2)
+
         try:
-            # read length (uint64) then blob
-            length = struct.unpack("!Q", conn.recv(8))[0]
+            # read length (uint64 big-endian) then blob
+            hdr = b""
+            while len(hdr) < 8:
+                chunk = s.recv(8 - len(hdr))
+                if not chunk:
+                    raise IOError("bootstrap socket closed")
+                hdr += chunk
+            length = struct.unpack("!Q", hdr)[0]
+
             buf = b""
             while len(buf) < length:
-                buf += conn.recv(min(65536, length-len(buf)))
+                chunk = s.recv(min(65536, length - len(buf)))
+                if not chunk:
+                    raise IOError("bootstrap socket closed mid-stream")
+                buf += chunk
+
             (self.entry_map, self.escape_map, self.inner_host_macs,
-             self.prevent_smart, self.port_dest_map) = pickle.loads(buf)
+            self.prevent_smart, self.port_dest_map) = pickle.loads(buf)
         finally:
-            conn.close()
             s.close()
+
 
     def _action_listener(self):
         s = socket.socket()
