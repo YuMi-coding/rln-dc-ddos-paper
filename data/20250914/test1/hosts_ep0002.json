@@ -1,0 +1,50 @@
+{
+  "64.193.1.197": {
+    "good": false,
+    "bad": true
+  },
+  "204.123.164.111": {
+    "good": false,
+    "bad": true
+  },
+  "6.183.146.30": {
+    "good": true,
+    "bad": false
+  },
+  "180.216.217.160": {
+    "good": true,
+    "bad": false
+  },
+  "180.193.217.32": {
+    "good": true,
+    "bad": false
+  },
+  "158.9.183.197": {
+    "good": false,
+    "bad": true
+  },
+  "136.209.220.98": {
+    "good": true,
+    "bad": false
+  },
+  "72.67.62.45": {
+    "good": false,
+    "bad": true
+  },
+  "118.119.26.140": {
+    "good": true,
+    "bad": false
+  },
+  "139.87.90.17": {
+    "good": false,
+    "bad": true
+  },
+  "208.69.14.9": {
+    "good": false,
+    "bad": true
+  },
+  "40.191.31.98": {
+    "good": true,
+    "bad": false
+  }
+}

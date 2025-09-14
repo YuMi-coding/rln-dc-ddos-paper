@@ -1,0 +1,14 @@
+{
+  "episode": 3,
+  "tp": 0,
+  "tn": 0,
+  "fp": 0,
+  "fn": 0,
+  "support": 0,
+  "accuracy": 0.0,
+  "precision": 0.0,
+  "recall": 0.0,
+  "f1": 0.0,
+  "coverage": 0.0,
+  "threshold": 0.5
+}

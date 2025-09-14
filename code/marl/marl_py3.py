@@ -135,7 +135,7 @@ def marlExperiment(
 
     reward_direction: str = "in",
     state_direction: str = "in",
-    actions_target_flows: bool = False,
+    actions_target_flows: bool = False, # <-- set to True in the call below
 
     bw_mon_socketed: bool = False,
     unix_sock: bool = True,
@@ -186,6 +186,13 @@ def marlExperiment(
     
     interactive_cli_pre: bool = False,
     interactive_cli_post: bool = True,
+
+
+    # Reporting for external orchestration
+    log_dir: str = "logs",
+    log_actions: bool = True,
+    allow_threshold: float = 0.5,   # allow_prob < 0.5 => predict "bad"
+
 ):
 
     # --------------- Agent selection ----------------
@@ -281,7 +288,8 @@ def marlExperiment(
     # ---- helpers for JSON policy → controller actions ----
     def pdrop_prob_to_group_idx(prob_allow: float) -> int:
         # original code treated ac_prob as allow probability
-        return int(prob_allow * num_drop_groups)
+        idx = int(prob_allow * num_drop_groups)
+        return max(0, min(num_drop_groups - 1, idx))
 
     def internal_choose_group(group: int, ip="10.0.0.1", subnet="255.255.255.0",
                               target_ip=None, force_old=None) -> Dict[str, Any]:
@@ -989,6 +997,22 @@ def marlExperiment(
     old_hosts = []
 
     for ep in range(episodes):
+        # --- NEW: per-episode confusion counts (we'll evaluate using the last prediction per host) ---
+        ep_counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+        # --- NEW: per-episode logs & metrics ---
+        os.makedirs(log_dir, exist_ok=True)
+        action_fp = None
+        actions_written = 0
+        if log_actions and actions_target_flows:
+            action_fp = open(os.path.join(log_dir, f"actions_ep{ep:04d}.csv"), "w", buffering=1)
+            action_fp.write("step,learner,src_ip,dst_ip,allow_prob,pred_bad,truth_bad\n")
+
+        # Ground-truth maps (filled after hosts are created)
+        truth_map = {}         # ip_int -> is_good (bool)
+        truth_bad_map = {}     # ip_int -> is_bad (bool)
+        last_pred_bad = {}     # ip_int -> last predicted bad (bool) within this episode
+
+
         Cleanup.cleanup()
         if interrupted[0]: break
 
@@ -1116,6 +1140,21 @@ def marlExperiment(
         bw_teams = {}
 
         all_hosts = makeHosts(old_hosts, externals, *host_range)
+        # --- NEW: build ground-truth from all_hosts ---
+        truth_map.clear(); truth_bad_map.clear()
+        for (host, good, bw, _, ip, _, _) in all_hosts:
+            ip_int = struct.unpack("I", socket.inet_aton(ip))[0]
+            truth_map[ip_int] = bool(good)
+            truth_bad_map[ip_int] = (not good)
+
+        # Persist the episode's host truth (human readable)
+        with open(os.path.join(log_dir, f"hosts_ep{ep:04d}.json"), "w") as f:
+            json.dump(
+                { socket.inet_ntoa(struct.pack("I", ip)): {"good": truth_map[ip], "bad": truth_bad_map[ip]}
+                for ip in truth_map.keys() },
+                f, indent=2
+            )
+
         old_hosts = all_hosts
 
         host_ip_mac_map = {}
@@ -1163,7 +1202,10 @@ def marlExperiment(
             CLI(net)
 
         print(monitored_links)
-        mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
+        # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
+        mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon", "-s"] + monitored_links, stdin=PIPE, stderr=sys.stderr)
+        bw_mon_socketed = True
+        unix_sock = True
 
         bw_sock = None
         if bw_mon_socketed:
@@ -1487,7 +1529,7 @@ def marlExperiment(
             last_traffic_ratio = min(dest_sum_data[0]/bw_all[0], 1.0)
             if not (i % 10):
                 print("\titer {}/{}, good:{}, load:{:.2f} ({:.2f},{:.2f})".format(i, episode_length, last_traffic_ratio, dest_sum_data[0] + dest_sum_data[1], *direction_sum))
-
+                
             intime = time.time()
             for learner_no, (node_label, sarsa, leader_nodes) in enumerate(actors):
                 node = vertex_map[node_label]
@@ -1504,9 +1546,47 @@ def marlExperiment(
                     return winner
                 hash_fn = smart_hash if actions_target_flows else dumb_hash
 
+                # def indices_for_state_vec(dst_ip, src_ip, show_choices=False):
+                #     curr = node_label
+                #     end = dest_from_ip[dst_ip]
+                #     path = [curr]
+                #     while curr != end:
+                #         next_set = list(dest_map[curr][end])
+                #         curr = next_set[hash_fn(len(next_set), src_ip, dst_ip, host_ip_mac_map.get(src_ip, "00:00:00:00:00:00"))]
+                #         path.append(curr)
+                #     path.reverse()
+                #     parts = list(zip(path, path[1:]))
+                #     h0 = parts[0]; h3 = parts[-1]
+                #     internals = []
+                #     if len(parts) == 1:
+                #         internals = [h0, h3]
+                #     else:
+                #         usables = parts[1:-1]
+                #         tert_pt = float(len(usables)) / 3.0
+                #         internals.append(usables[int(tert_pt)])
+                #         internals.append(usables[int(tert_pt*2)])
+                #     return [h0] + internals + [h3]
                 def indices_for_state_vec(dst_ip, src_ip, show_choices=False):
+                    # normalize dst_ip to dotted-quad string
+                    if isinstance(dst_ip, (int, np.integer)):
+                        try:
+                            dst_ip_s = socket.inet_ntoa(struct.pack("I", int(dst_ip)))
+                        except Exception:
+                            dst_ip_s = None
+                    elif isinstance(dst_ip, str):
+                        dst_ip_s = dst_ip
+                    else:
+                        dst_ip_s = None
+
+                    # pick destination node
+                    if dst_ip_s in dest_from_ip:
+                        end = dest_from_ip[dst_ip_s]
+                    else:
+                        # Fallback if the flow parser gave us something we don't track as a server
+                        # (e.g., legacy non-socketed parser or reverse/garbled IP)
+                        end = dests[0]
+
                     curr = node_label
-                    end = dest_from_ip[dst_ip]
                     path = [curr]
                     while curr != end:
                         next_set = list(dest_map[curr][end])
@@ -1521,9 +1601,10 @@ def marlExperiment(
                     else:
                         usables = parts[1:-1]
                         tert_pt = float(len(usables)) / 3.0
-                        internals.append(usables[int(tert_pt)])
-                        internals.append(usables[int(tert_pt*2)])
+                        internals.append(usables[int(tert_pt)] if usables else h0)
+                        internals.append(usables[int(tert_pt*2)] if len(usables) > 1 else h3)
                     return [h0] + internals + [h3]
+
 
                 t_dest = dests[np.random.choice(len(dests))]
                 main_links = indices_for_state_vec(t_dest[0][0], 0)
@@ -1547,8 +1628,29 @@ def marlExperiment(
                     flow_space = learner_stats[l_index]
                     flow_traces = learner_traces[l_index]
                     flows_seen = parsed_flows[l_index]
+                    if i % 50 == 0:
+                        print(f"[ep={ep} iter={i}] learner {learner_no}: flows_seen={len(flows_seen)}")
                     queue_holder = learner_queues[l_index]
                     fvec_holder = learner_fvecs[l_index]
+
+                    # Normalize flows_seen so we always iterate over (src_ip, dst_ip, props)
+                    norm_flows = []
+                    if flows_seen:
+                        sample = flows_seen[0]
+                        # Socketed path returns (src_ip_int, props_tuple)
+                        if isinstance(sample, tuple) and len(sample) == 2 and not isinstance(sample[1], dict):
+                            # If you have a single server, use that as dst.
+                            # Otherwise you can pick the hashed server like you already do elsewhere.
+                            default_dst_ip = list(dest_from_ip.keys())[0]  # string like "10.0.0.x"
+                            default_dst_ip_int = struct.unpack("I", socket.inet_aton(default_dst_ip))[0]
+                            for (src_ip_int, props_tuple) in flows_seen:
+                                norm_flows.append((src_ip_int, default_dst_ip_int, props_tuple))
+                        else:
+                            # Legacy/non-socketed path: list of (src_ip_int, {dst_ip_str: props_tuple, ...})
+                            for (src_ip_int, props_dict) in flows_seen:
+                                for (dst_ip_str, props_tuple) in props_dict.items():
+                                    dst_ip_int = struct.unpack("I", socket.inet_aton(dst_ip_str))[0]
+                                    norm_flows.append((src_ip_int, dst_ip_int, props_tuple))
 
                     total_spent = 0.0
                     def can_act(): return trs_maxtime is None or total_spent <= trs_maxtime
@@ -1556,63 +1658,65 @@ def marlExperiment(
                     (local_work, local_work_set, local_visited_set) = queue_holder["curr"]
                     local_pos = queue_holder["pos"]
 
-                    for (src_ip, props_dict) in flows_seen:
-                        for (dst_ip, props) in props_dict.items():
-                            main_links = indices_for_state_vec(dst_ip, src_ip)
-                            state_vec = [total_mbps[link_map[x]] for x in main_links]
-                            flows_to_query.append(src_ip)
+                    for (src_ip, dst_ip, props) in norm_flows:
+                        main_links = indices_for_state_vec(dst_ip, src_ip)
+                        state_vec = [total_mbps[link_map[x]] for x in main_links]
+                        flows_to_query.append(src_ip)
+                        main_links = indices_for_state_vec(dst_ip, src_ip)
+                        state_vec = [total_mbps[link_map[x]] for x in main_links]
+                        flows_to_query.append(src_ip)
 
-                            ip_pair = (src_ip, dst_ip)
-                            if ip_pair not in flow_space:
-                                flow_space[ip_pair] = {
-                                    "ip": src_ip, "last_act": 0.0 if not spiffy_mode else 0.05,
-                                    "last_rate_in": -1.0, "last_rate_out": -1.0,
-                                    "pkt_in_count": 0, "pkt_out_count": 0,
-                                }
-                            l = flow_space[ip_pair]
-                            l["cx_ratio"] = min(*props[1:3]) / max(*props[1:3])
-                            l["length"] = props[0]
-                            l["size"] = props[1] + props[2]
-                            l["mean_iat"] = props[11]
-                            l["pkt_in_count"] += props[7]
-                            l["pkt_out_count"] += props[10]
-                            l["pkt_in_wnd_count"] = props[7]
-                            l["pkt_out_wnd_count"] = props[10]
-                            l["mean_bpp_in"] = props[5]
-                            l["mean_bpp_out"] = props[8]
-                            l["bytes_in"] = props[3]
-                            l["bytes_out"] = props[4]
+                        ip_pair = (src_ip, dst_ip)
+                        if ip_pair not in flow_space:
+                            flow_space[ip_pair] = {
+                                "ip": src_ip, "last_act": 0.0 if not spiffy_mode else 0.05,
+                                "last_rate_in": -1.0, "last_rate_out": -1.0,
+                                "pkt_in_count": 0, "pkt_out_count": 0,
+                            }
+                        l = flow_space[ip_pair]
+                        l["cx_ratio"] = min(*props[1:3]) / max(*props[1:3])
+                        l["length"] = props[0]
+                        l["size"] = props[1] + props[2]
+                        l["mean_iat"] = props[11]
+                        l["pkt_in_count"] += props[7]
+                        l["pkt_out_count"] += props[10]
+                        l["pkt_in_wnd_count"] = props[7]
+                        l["pkt_out_wnd_count"] = props[10]
+                        l["mean_bpp_in"] = props[5]
+                        l["mean_bpp_out"] = props[8]
+                        l["bytes_in"] = props[3]
+                        l["bytes_out"] = props[4]
 
-                            observed_rate_in = 8000.0*float(props[3])/time_ns
-                            observed_rate_out = 8000.0*float(props[4])/time_ns
+                        observed_rate_in = 8000.0*float(props[3])/time_ns
+                        observed_rate_out = 8000.0*float(props[4])/time_ns
 
-                            if l["last_rate_in"] < 0.0:
-                                l["last_rate_in"] = observed_rate_in
-                                l["last_rate_out"] = observed_rate_out
-                            l["delta_in"] = observed_rate_in - l["last_rate_in"]
-                            l["delta_out"] = observed_rate_out - l["last_rate_out"]
+                        if l["last_rate_in"] < 0.0:
+                            l["last_rate_in"] = observed_rate_in
+                            l["last_rate_out"] = observed_rate_out
+                        l["delta_in"] = observed_rate_in - l["last_rate_in"]
+                        l["delta_out"] = observed_rate_out - l["last_rate_out"]
 
-                            total_vec = state_vec + flow_to_state_vec(l)
-                            flow_space[ip_pair] = l
+                        total_vec = state_vec + flow_to_state_vec(l)
+                        flow_space[ip_pair] = l
 
-                            fvec = combine_flow_vecs(fvec_holder[ip_pair], total_vec) if ip_pair in fvec_holder else total_vec
-                            fvec_holder[ip_pair] = fvec
+                        fvec = combine_flow_vecs(fvec_holder[ip_pair], total_vec) if ip_pair in fvec_holder else total_vec
+                        fvec_holder[ip_pair] = fvec
 
-                            if ip_pair not in local_work_set or ip_pair in local_visited_set:
-                                queue_holder["future"].add(ip_pair)
+                        if ip_pair not in local_work_set or ip_pair in local_visited_set:
+                            queue_holder["future"].add(ip_pair)
 
-                            if spiffy_but_bad:
-                                total_s_bw = observed_rate_in
-                                if spiffy_traffic_dir == "out": total_s_bw = observed_rate_out
-                                elif spiffy_traffic_dir == "inout": total_s_bw += observed_rate_out
-                                if spiffy_mbps_cutoff is not None and total_s_bw < spiffy_mbps_cutoff and total_s_bw > 0.0:
-                                    spiffy_verdict[ip_pair] = False
-                                expt_count = max(spiffy_min_experiments, min(spiffy_max_experiments, int(spiffy_pick_prob * float(len(flows_seen)))))
-                                if ip_pair in spiffy_measurements[0]:
-                                    spiffy_measurements[1][ip_pair] = total_s_bw
-                                elif ip_pair not in spiffy_verdict and total_s_bw > 0.0 and len(spiffy_measurements[0]) < expt_count and np.random.random() < spiffy_pick_prob:
-                                    print("spiffy observing flow", ip_pair)
-                                    spiffy_measurements[0][ip_pair] = (total_s_bw, time.time(), False, node)
+                        if spiffy_but_bad:
+                            total_s_bw = observed_rate_in
+                            if spiffy_traffic_dir == "out": total_s_bw = observed_rate_out
+                            elif spiffy_traffic_dir == "inout": total_s_bw += observed_rate_out
+                            if spiffy_mbps_cutoff is not None and total_s_bw < spiffy_mbps_cutoff and total_s_bw > 0.0:
+                                spiffy_verdict[ip_pair] = False
+                            expt_count = max(spiffy_min_experiments, min(spiffy_max_experiments, int(spiffy_pick_prob * float(len(flows_seen)))))
+                            if ip_pair in spiffy_measurements[0]:
+                                spiffy_measurements[1][ip_pair] = total_s_bw
+                            elif ip_pair not in spiffy_verdict and total_s_bw > 0.0 and len(spiffy_measurements[0]) < expt_count and np.random.random() < spiffy_pick_prob:
+                                print("spiffy observing flow", ip_pair)
+                                spiffy_measurements[0][ip_pair] = (total_s_bw, time.time(), False, node)
 
                     if local_pos >= len(local_work):
                         local_pos = 0
@@ -1691,6 +1795,24 @@ def marlExperiment(
                         tx_ac = machine.action() if isinstance(l_action, (int, int)) else l_action
                         updateUpstreamRoute(node, ac_prob=tx_ac, target_ip=ip_pair)
 
+                        # --- NEW: log decision and update per-host "last prediction" ---
+                        allow_prob = float(tx_ac)
+                        src_ip_int, dst_ip_int = ip_pair[0], ip_pair[1]
+                        pred_bad = (allow_prob < allow_threshold)
+
+                        truth_flag = truth_bad_map.get(src_ip_int, None)
+                        if truth_flag is not None:
+                            last_pred_bad[src_ip_int] = pred_bad  # used for end-of-episode scoring
+
+                        if action_fp is not None:
+                            src_s = socket.inet_ntoa(struct.pack("I", src_ip_int))
+                            dst_s = socket.inet_ntoa(struct.pack("I", dst_ip_int))
+                            truth_bad_str = "" if truth_flag is None else ("1" if truth_flag else "0")
+                            action_fp.write(f"{i},{learner_no},{src_s},{dst_s},{allow_prob:.6f},{1 if pred_bad else 0},{truth_bad_str}\n")
+                            actions_written += 1
+
+
+
                         e_t = time.time()
                         total_spent += e_t - s_t
                         if record_times: action_comps[-1].append((i, e_t - s_t))
@@ -1750,6 +1872,51 @@ def marlExperiment(
             try: proc.terminate()
             except: print("couldn't cleanly shutdown host process...")
 
+        # --- NEW: per-episode metrics from final prediction of each host we saw ---
+        if action_fp is not None:
+            action_fp.close()
+
+        # Compare last prediction vs truth
+        n_pred = 0
+        for ip_int, is_bad in truth_bad_map.items():
+            if ip_int not in last_pred_bad:
+                continue  # no prediction made for this host this episode
+            n_pred += 1
+            pred_bad = last_pred_bad[ip_int]
+            if is_bad and pred_bad: ep_counts["tp"] += 1
+            elif (not is_bad) and (not pred_bad): ep_counts["tn"] += 1
+            elif (not is_bad) and pred_bad: ep_counts["fp"] += 1
+            elif is_bad and (not pred_bad): ep_counts["fn"] += 1
+
+        # Derived metrics
+        tp, tn, fp, fn = (ep_counts[k] for k in ("tp","tn","fp","fn"))
+        support = tp + tn + fp + fn
+        acc = (tp + tn) / support if support else 0.0
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2*prec*rec)/(prec+rec) if (prec+rec) else 0.0
+        coverage = n_pred / max(1, len(truth_bad_map))  # fraction of hosts we actually produced a prediction for
+
+        # Write JSON + append CSV row
+        ep_metrics = {
+            "episode": ep,
+            "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+            "support": support,
+            "accuracy": acc, "precision": prec, "recall": rec, "f1": f1,
+            "coverage": coverage,
+            "threshold": allow_threshold,
+        }
+        with open(os.path.join(log_dir, f"metrics_ep{ep:04d}.json"), "w") as f:
+            json.dump(ep_metrics, f, indent=2)
+
+        # Append to summary CSV
+        summary_path = os.path.join(log_dir, "metrics_summary.csv")
+        if not os.path.exists(summary_path):
+            with open(summary_path, "w") as f:
+                f.write("episode,tp,tn,fp,fn,support,accuracy,precision,recall,f1,coverage,threshold\n")
+        with open(summary_path, "a") as f:
+            f.write(f"{ep},{tp},{tn},{fp},{fn},{support},{acc:.6f},{prec:.6f},{rec:.6f},{f1:.6f},{coverage:.6f},{allow_threshold}\n")
+
         host_procs = []
         server_procs = []
         ctl_proc = None
@@ -1760,24 +1927,59 @@ def marlExperiment(
     return (rewards, good_traffic_percents, total_loads, store_sarsas, random.getstate(), action_comps)
 
 
+# if __name__ == "__main__":
+#     import argparse
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post",
+#                     help="Open Mininet CLI: pre-run, post-run (default), both, or none.")
+#     ap.add_argument("--episodes", type=int, default=1)
+#     ap.add_argument("--episode-length", type=int, default=5000)
+#     args = ap.parse_args()
+
+#     cli_pre  = args.cli in ("pre", "both")
+#     cli_post = args.cli in ("post", "both")
+
+#     marlExperiment(
+#         model = "nginx",
+#         submodel="http",
+#         use_controller=True,
+#         episodes=args.episodes,
+#         episode_length=args.episode_length,
+#         interactive_cli_pre=cli_pre,
+#         interactive_cli_post=cli_post,
+#         actions_target_flows=True,   # <— IMPORTANT for per-flow decisions
+#         log_actions=True,
+#         bw_mon_socketed=True,   # <<< important
+#         unix_sock=True,         # default in your code
+#         log_dir="../data/20250914/",  # or wherever you want the logs to land
+#         allow_threshold=0.5,         # tune to taste
+#     )
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post",
-                    help="Open Mininet CLI: pre-run, post-run (default), both, or none.")
+    ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--episode-length", type=int, default=5000)
+    ap.add_argument("--log-dir", type=str, default="logs")  # <— add this arg if you want
     args = ap.parse_args()
 
     cli_pre  = args.cli in ("pre", "both")
     cli_post = args.cli in ("post", "both")
 
     marlExperiment(
-        model = "nginx",
+        model="nginx",
         submodel="http",
         use_controller=True,
         episodes=args.episodes,
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,
         interactive_cli_post=cli_post,
+        actions_target_flows=True,     # per-flow decisions needed for metrics
+        log_actions=True,
+        allow_threshold=0.5,
+        bw_mon_socketed=True,          # <— IMPORTANT
+        unix_sock=True,
+        log_dir=args.log_dir,          # or hardcode your data dir
     )
