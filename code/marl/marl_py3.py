@@ -59,6 +59,15 @@ def send_ctl(action_obj: Dict[str, Any], port: int = controller_build_port + 1) 
         resp = s.recv(4)
         return struct.unpack("!I", resp)[0] if len(resp) == 4 else 0
 
+def ip_to_int(ip_str: str) -> int:
+    return struct.unpack("!I", socket.inet_aton(ip_str))[0]
+
+def int_to_ip(ip_int: int) -> str:
+    return socket.inet_ntoa(struct.pack("!I", int(ip_int)))
+
+def ip_to_int_native(ip_str: str) -> int:
+    # native-endian u32 (matches non-socketed code path)
+    return struct.unpack("=I", socket.inet_aton(ip_str))[0]
 # ------------------------------------------------------------
 # Main experiment: Python-3 rewrite, twink/ofp5 replaced by
 # controller JSON ops; preserves original behavior/structure.
@@ -484,9 +493,17 @@ def marlExperiment(
     def updateUpstreamRoute(switch, out_port=1, ac_prob=0.0, target_ip=None):
         if switch.controlled: return
         group_idx = pdrop_prob_to_group_idx(ac_prob)
+        # if target_ip is not None:
+        #     (src, dst) = target_ip
+        #     msg = internal_choose_group(group_idx, ip=dst, target_ip=src, subnet="255.255.255.255")
+        # else:
+        #     msg = internal_choose_group(group_idx)
         if target_ip is not None:
             (src, dst) = target_ip
-            msg = internal_choose_group(group_idx, ip=dst, target_ip=src, subnet="255.255.255.255")
+            # ensure dotted strings
+            src_str = src if isinstance(src, str) else int_to_ip(src)
+            dst_str = dst if isinstance(dst, str) else int_to_ip(dst)
+            msg = internal_choose_group(group_idx, ip=dst_str, target_ip=src_str, subnet="255.255.255.255")
         else:
             msg = internal_choose_group(group_idx)
         cmd_list = []
@@ -1143,14 +1160,14 @@ def marlExperiment(
         # --- NEW: build ground-truth from all_hosts ---
         truth_map.clear(); truth_bad_map.clear()
         for (host, good, bw, _, ip, _, _) in all_hosts:
-            ip_int = struct.unpack("I", socket.inet_aton(ip))[0]
+            ip_int = struct.unpack("!I", socket.inet_aton(ip))[0]
             truth_map[ip_int] = bool(good)
             truth_bad_map[ip_int] = (not good)
 
         # Persist the episode's host truth (human readable)
         with open(os.path.join(log_dir, f"hosts_ep{ep:04d}.json"), "w") as f:
             json.dump(
-                { socket.inet_ntoa(struct.pack("I", ip)): {"good": truth_map[ip], "bad": truth_bad_map[ip]}
+                { socket.inet_ntoa(struct.pack("!I", ip)): {"good": truth_map[ip], "bad": truth_bad_map[ip]}
                 for ip in truth_map.keys() },
                 f, indent=2
             )
@@ -1158,9 +1175,11 @@ def marlExperiment(
         old_hosts = all_hosts
 
         host_ip_mac_map = {}
+        flows_to_query = set()
         for (host, good, bw, _, _, extern_no, sm) in all_hosts:
-            lhs = struct.unpack("I", socket.inet_aton(host.IP()))[0]
+            lhs = ip_to_int_native(host.IP())
             host_ip_mac_map[lhs] = host.MAC()
+            flows_to_query.add(lhs)
             (_a_node, _a_sarsa, a_leader) = actors[extern_no]
             bw_team = None
             if a_leader is not None:
@@ -1201,23 +1220,39 @@ def marlExperiment(
             print("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
             CLI(net)
 
-        print(monitored_links)
+        print("monitored_links raw:", monitored_links)
+        print("monitored_links sanitized:", [n.lstrip('!') for n in monitored_links])
         # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
-        mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon", "-s"] + monitored_links, stdin=PIPE, stderr=sys.stderr)
-        bw_mon_socketed = True
-        unix_sock = True
+
+        # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon", "-s"] + monitored_links, stdin=PIPE, stderr=sys.stderr)
+        bw_ifaces = [name.lstrip('!') for name in monitored_links]
+
+        # bw_mon_socketed = False # XXX mon_cmd is always socketed for now
+        # unix_sock = True
 
         bw_sock = None
         if bw_mon_socketed:
+            mon_cmd = server_switch.popen(
+                ["../marl-bwmon/marl-bwmon", "-s"] + bw_ifaces,
+                stdin=PIPE, stderr=sys.stderr
+            )
             time.sleep(0.5)
             if unix_sock:
                 bw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 bw_sock.connect("bwmon-sock")
+                bw_sock.settimeout(3.0)  # after connect
             else:
                 bw_sock = socket.create_connection(("127.0.0.1", stats_port))
             bw_sock.setblocking(0)
 
-            sz_packer = struct.Struct("!I")
+            try:
+                bw_sock.sendall(struct.pack("=I", 0))  # zero flows
+                # expect 8 bytes header back (time_ns); if this times out, protocol still mismatched
+                _hdr = bw_sock.recv(8)
+            except Exception as e:
+                print("[bwmon] warm-up failed:", e)
+
+            sz_packer = struct.Struct("=I")
             ip_packer = struct.Struct("=I")
             time_packer = struct.Struct("=q")
             bytes_packer = struct.Struct("=Q")
@@ -1232,9 +1267,14 @@ def marlExperiment(
                 if print_times: print("interlude:", outtime - intime)
 
                 def read_n(n, recvd):
+                    deadline = time.time() + 5.0
                     while len(recvd) < n:
+                        if time.time() > deadline:
+                            raise TimeoutError(f"bwmon read timeout waiting for {n} bytes")
                         try:
                             t = bw_sock.recv(4096)
+                        except socket.timeout:
+                            continue
                         except socket.error as e:
                             err = e.args[0]
                             if err in (errno.EAGAIN, errno.EWOULDBLOCK):
@@ -1280,37 +1320,100 @@ def marlExperiment(
                 return (time_ns, unfused_load_mbps, parsed_flows)
 
         else:
-            def ask_stats(_flows, _n_ifs, _n_agents):
+            mon_cmd = server_switch.popen(
+                ["../marl-bwmon/marl-bwmon"] + bw_ifaces,
+                stdin=PIPE, stdout=PIPE, stderr=sys.stderr
+            )
+            # def ask_stats(_flows, _n_ifs, _n_agents):
+            #     mon_cmd.stdin.write(b"\n")
+            #     mon_cmd.stdin.flush()
+            #     data = mon_cmd.stdout.readline().strip().decode().split(",")
+            #     flow_stat_str = mon_cmd.stdout.readline().strip().decode()
+            #     flow_stat_break = flow_stat_str.split("]")
+            #     split_stats = [s.strip().split("[")[-1] for s in flow_stat_break if len(s) > 0]
+            #     almost_subs = [s.split(")") if len(s) > 0 else "" for s in split_stats]
+            #     subs = []
+            #     for set_str in almost_subs:
+            #         subs.append([a.split("(")[-1].split("|") for a in set_str])
+
+            #     parsed_flows = []
+            #     for l in subs:
+            #         layer = []
+            #         for e in l:
+            #             if not e or len(e[0]) == 0: continue
+            #             prop_holder = {}
+            #             for flow_prop_str in e[1:]:
+            #                 prop_str_parts = flow_prop_str.split(",")
+            #                 if len(prop_str_parts) < 2 or prop_str_parts[1] == "": continue
+            #                 props = [float(part) for part in prop_str_parts[1:]]
+            #                 prop_holder[prop_str_parts[0]] = props
+            #             if e[0] != "0.0.0.0":
+            #                 ip_bytes = socket.inet_pton(socket.AF_INET, e[0])
+            #                 layer.append((struct.unpack("I", ip_bytes)[0], prop_holder))
+            #         parsed_flows.append(layer)
+
+            #     while len(parsed_flows) < _n_agents:
+            #         parsed_flows.append([])
+
+            #     time_ns = int(data[0][:-2])
+            #     def mbpsify_bytes(bts): return 8000*float(bts)/time_ns
+            #     unfused_load_mbps = [list(map(mbpsify_bytes, el.strip().split(" "))) for el in data[1:]]
+            #     return (time_ns, unfused_load_mbps, parsed_flows)
+            # --- STDOUT MODE PARSER (replace your current non-socketed ask_stats) ---
+            def ask_stats(_flows, n_ifs, n_agents):
+                # Trigger one snapshot
                 mon_cmd.stdin.write(b"\n")
                 mon_cmd.stdin.flush()
-                data = mon_cmd.stdout.readline().strip().decode().split(",")
-                flow_stat_str = mon_cmd.stdout.readline().strip().decode()
-                flow_stat_break = flow_stat_str.split("]")
-                split_stats = [s.strip().split("[")[-1] for s in flow_stat_break if len(s) > 0]
-                almost_subs = [s.split(")") if len(s) > 0 else "" for s in split_stats]
-                subs = []
-                for set_str in almost_subs:
-                    subs.append([a.split("(")[-1].split("|") for a in set_str])
 
-                parsed_flows = []
-                for l in subs:
-                    layer = []
-                    for e in l:
-                        if not e or len(e[0]) == 0: continue
-                        prop_holder = {}
-                        for flow_prop_str in e[1:]:
-                            prop_str_parts = flow_prop_str.split(",")
-                            if len(prop_str_parts) < 2 or prop_str_parts[1] == "": continue
-                            props = [float(part) for part in prop_str_parts[1:]]
-                            prop_holder[prop_str_parts[0]] = props
-                        if e[0] != "0.0.0.0":
-                            ip_bytes = socket.inet_pton(socket.AF_INET, e[0])
-                            layer.append((struct.unpack("I", ip_bytes)[0], prop_holder))
-                    parsed_flows.append(layer)
+                line = mon_cmd.stdout.readline().decode().strip()
+                if not line:
+                    # If nothing came back, return zeros defensively
+                    time_ns = 1
+                    unfused_load_mbps = [(0.0, 0.0) for _ in range(n_ifs * 2)]  # [in0, out0, in1, out1, ...]
+                    parsed_flows = [[] for _ in range(n_agents)]
+                    return (time_ns, unfused_load_mbps, parsed_flows)
 
-                time_ns = int(data[0][:-2])
-                def mbpsify_bytes(bts): return 8000*float(bts)/time_ns
-                unfused_load_mbps = [list(map(mbpsify_bytes, el.strip().split(" "))) for el in data[1:]]
+                # Example line:
+                # 862420385ns, 18216 12804, 817512 574628, 18150 12672, 814550 568704, ...
+                parts = [p.strip() for p in line.split(",")]
+                # first token is like "862420385ns"
+                ttok = parts[0]
+                if ttok.endswith("ns"):
+                    ttok = ttok[:-2]
+                time_ns = int(ttok) if ttok.isdigit() else 1
+
+                # For each interface, stdout prints two pairs: (IN good,bad), (OUT good,bad)
+                # So total tokens expected after the time token: 2 * n_ifs entries.
+                in_out_pairs = []
+                for p in parts[1:]:
+                    if not p:
+                        continue
+                    ab = p.split()
+                    if len(ab) != 2:
+                        # tolerate odd spacing
+                        ab = [x for x in ab if x]
+                    if len(ab) == 2:
+                        try:
+                            a = int(ab[0]); b = int(ab[1])
+                        except ValueError:
+                            a = b = 0
+                        in_out_pairs.append((a, b))
+
+                # If fewer tokens arrived (race), pad with zeros
+                while len(in_out_pairs) < 2 * n_ifs:
+                    in_out_pairs.append((0, 0))
+
+                # Convert to Mbps using the same formula as socket mode
+                def mbpsify(bts):  # bts = bytes in the sample window
+                    return 8000.0 * float(bts) / max(1, time_ns)
+
+                # Build unfused_load_mbps in the same shape that the rest of your code expects:
+                # [ (in_good,in_bad), (out_good,out_bad), (in_good,in_bad), (out_good,out_bad), ... ]
+                unfused_load_mbps = [(mbpsify(g), mbpsify(b)) for (g, b) in in_out_pairs[: 2 * n_ifs]]
+
+                # No per-agent flow blocks in stdout mode → return empty lists per learner
+                parsed_flows = [[] for _ in range(n_agents)]
+
                 return (time_ns, unfused_load_mbps, parsed_flows)
 
         server_procs = []
@@ -1418,7 +1521,7 @@ def marlExperiment(
         learner_traces = [{} for _ in actors]
         learner_queues = [{"curr": ([], set(), set()), "future": set(), "pos": 0} for _ in actors]
         learner_fvecs = [{} for _ in actors]
-        flows_to_query = []
+        # flows_to_query = []
 
         spiffy_measurements = [{}, {}]
         spiffy_verdict = {}
@@ -1462,7 +1565,7 @@ def marlExperiment(
                         if bad_flow:
                             blockSpiffyFlow(spiffy_dest_switches, src_ip, dst_ip, ingress_switch=node)
                         to_delete.append(ip_pair)
-                        print(socket.inet_ntoa(struct.pack("I", src_ip)), rate, curr_rate, tbe, spiffy_expansion_factor, bad_flow, "should have been", (src_ip%2 == 1))
+                        print(socket.inet_ntoa(struct.pack("!I", src_ip)), rate, curr_rate, tbe, spiffy_expansion_factor, bad_flow, "should have been", (src_ip%2 == 1))
                 for ip in to_delete:
                     for el in spiffy_measurements:
                         if ip in el: del el[ip]
@@ -1470,7 +1573,11 @@ def marlExperiment(
             time.sleep(dt)
 
             preask = time.time()
-            (time_ns, unfused_load_mbps, parsed_flows) = ask_stats(flows_to_query, len(monitored_links), len(learner_pos))
+            if i % 20 == 0:
+                print(f"[debug] query_size={len(flows_to_query)} example={next(iter(flows_to_query)) if flows_to_query else None}")
+            (time_ns, unfused_load_mbps, parsed_flows) = ask_stats(list(flows_to_query), len(monitored_links), len(learner_pos))
+            if i % 20 == 0:
+                print(f"[debug] total_flow_entries={sum(len(x) for x in parsed_flows)} per_agent={[len(x) for x in parsed_flows]}")
             postask = time.time()
             if print_times: print("total:", postask - preask)
 
@@ -1497,7 +1604,7 @@ def marlExperiment(
                 return reward_src
 
             l_cap = (2.0 if state_direction == "fuse" else 1.0) * capacity
-            flows_to_query = []
+            # flows_to_query = []
             datas = {}
             totals = {}
             g_rewards = {}
@@ -1570,7 +1677,7 @@ def marlExperiment(
                     # normalize dst_ip to dotted-quad string
                     if isinstance(dst_ip, (int, np.integer)):
                         try:
-                            dst_ip_s = socket.inet_ntoa(struct.pack("I", int(dst_ip)))
+                            dst_ip_s = socket.inet_ntoa(struct.pack("!I", int(dst_ip)))
                         except Exception:
                             dst_ip_s = None
                     elif isinstance(dst_ip, str):
@@ -1627,7 +1734,7 @@ def marlExperiment(
                 if actions_target_flows:
                     flow_space = learner_stats[l_index]
                     flow_traces = learner_traces[l_index]
-                    flows_seen = parsed_flows[l_index]
+                    flows_seen = parsed_flows[l_index] if l_index < len(parsed_flows) else []
                     if i % 50 == 0:
                         print(f"[ep={ep} iter={i}] learner {learner_no}: flows_seen={len(flows_seen)}")
                     queue_holder = learner_queues[l_index]
@@ -1642,14 +1749,14 @@ def marlExperiment(
                             # If you have a single server, use that as dst.
                             # Otherwise you can pick the hashed server like you already do elsewhere.
                             default_dst_ip = list(dest_from_ip.keys())[0]  # string like "10.0.0.x"
-                            default_dst_ip_int = struct.unpack("I", socket.inet_aton(default_dst_ip))[0]
+                            default_dst_ip_int = struct.unpack("!I", socket.inet_aton(default_dst_ip))[0]
                             for (src_ip_int, props_tuple) in flows_seen:
                                 norm_flows.append((src_ip_int, default_dst_ip_int, props_tuple))
                         else:
                             # Legacy/non-socketed path: list of (src_ip_int, {dst_ip_str: props_tuple, ...})
                             for (src_ip_int, props_dict) in flows_seen:
                                 for (dst_ip_str, props_tuple) in props_dict.items():
-                                    dst_ip_int = struct.unpack("I", socket.inet_aton(dst_ip_str))[0]
+                                    dst_ip_int = struct.unpack("!I", socket.inet_aton(dst_ip_str))[0]
                                     norm_flows.append((src_ip_int, dst_ip_int, props_tuple))
 
                     total_spent = 0.0
@@ -1661,10 +1768,7 @@ def marlExperiment(
                     for (src_ip, dst_ip, props) in norm_flows:
                         main_links = indices_for_state_vec(dst_ip, src_ip)
                         state_vec = [total_mbps[link_map[x]] for x in main_links]
-                        flows_to_query.append(src_ip)
-                        main_links = indices_for_state_vec(dst_ip, src_ip)
-                        state_vec = [total_mbps[link_map[x]] for x in main_links]
-                        flows_to_query.append(src_ip)
+                        flows_to_query.add(src_ip)
 
                         ip_pair = (src_ip, dst_ip)
                         if ip_pair not in flow_space:
@@ -1805,8 +1909,8 @@ def marlExperiment(
                             last_pred_bad[src_ip_int] = pred_bad  # used for end-of-episode scoring
 
                         if action_fp is not None:
-                            src_s = socket.inet_ntoa(struct.pack("I", src_ip_int))
-                            dst_s = socket.inet_ntoa(struct.pack("I", dst_ip_int))
+                            src_s = int_to_ip(src_ip_int)        # was inet_ntoa(struct.pack("I", ...))
+                            dst_s = int_to_ip(dst_ip_int)
                             truth_bad_str = "" if truth_flag is None else ("1" if truth_flag else "0")
                             action_fp.write(f"{i},{learner_no},{src_s},{dst_s},{allow_prob:.6f},{1 if pred_bad else 0},{truth_bad_str}\n")
                             actions_written += 1
@@ -1979,7 +2083,7 @@ if __name__ == "__main__":
         actions_target_flows=True,     # per-flow decisions needed for metrics
         log_actions=True,
         allow_threshold=0.5,
-        bw_mon_socketed=True,          # <— IMPORTANT
-        unix_sock=True,
+        bw_mon_socketed=False,
+        unix_sock=False,
         log_dir=args.log_dir,          # or hardcode your data dir
     )
