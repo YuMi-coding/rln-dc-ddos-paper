@@ -210,8 +210,13 @@ def marlExperiment(
         def start(self, controllers):
             return super(MaybeControlledSwitch, self).start(self._controller_list())
 
+        # def _controller_list(self):
+        #     return [c0] if use_controller and self.controlled else []
+
         def _controller_list(self):
-            return [c0] if use_controller and self.controlled else []
+        # Attach ALL switches to the controller when use_controller is enabled
+            return [c0] if use_controller else []
+
 
     if max_bw is None:
         max_bw = n_teams * n_inters * n_learners * host_range[1] * evil_range[1]

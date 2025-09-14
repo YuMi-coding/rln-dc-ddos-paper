@@ -21,6 +21,9 @@ import socket, struct, threading, json, pickle
 BUILD_PORT = 6666
 ACT_PORT   = BUILD_PORT + 1
 
+# Pick a nominal per-port max, e.g., 100000 kbps (100 Mbps). Tune this to your topo link speeds.
+NOMINAL_KBPS = 100000
+
 class RLNController(app_manager.RyuApp):
     OFP_VERSIONS = [ofp.OFP_VERSION]
 
@@ -53,6 +56,9 @@ class RLNController(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=0, match=match, instructions=inst))
 
+        # NEW: baseline connectivity
+        self._add_base_flows(dp)
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in(self, ev):
         # simple ARP handling (optional)
@@ -66,7 +72,18 @@ class RLNController(app_manager.RyuApp):
             dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
                                             in_port=msg.match.get('in_port', ofp.OFPP_CONTROLLER),
                                             actions=actions, data=msg.data))
+    def _add_base_flows(self, dp):
+        # ARP: flood (priority 10)
+        match = parser.OFPMatch(eth_type=0x0806)
+        actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=10, match=match, instructions=inst))
 
+        # IPv4: normal L2 switching (priority 1)
+        match = parser.OFPMatch(eth_type=0x0800)
+        actions = [parser.OFPActionOutput(ofp.OFPP_NORMAL)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=1, match=match, instructions=inst))
     # def _bootstrap_listener(self):
     #     # same as your code: accept pickle once
     #     s = socket.socket()
@@ -85,6 +102,21 @@ class RLNController(app_manager.RyuApp):
     #     finally:
     #         conn.close()
     #         s.close()
+
+    def _ensure_meter(self, dp, meter_id, kbps):
+        # Drop all above kbps (approximate pdrop via rate shaping)
+        bands = [parser.OFPMeterBandDrop(rate=int(max(1, kbps)), burst_size=int(kbps // 10 or 1))]
+        mod = parser.OFPMeterMod(datapath=dp,
+                                command=ofp.OFPMC_ADD,
+                                flags=ofp.OFPMF_KBPS,
+                                meter_id=meter_id,
+                                bands=bands)
+        try:
+            dp.send_msg(mod)
+        except Exception:
+            # If it already exists, you might need to modify (OFPMC_MODIFY); keep it simple for now.
+            pass
+
 
     def _bootstrap_listener(self):
         import time
@@ -146,6 +178,7 @@ class RLNController(app_manager.RyuApp):
             req = json.loads(blob.decode("utf-8"))
             dpid = int(req.get("dpid"))
             dp = self.datapaths.get(dpid)
+            
             if not dp:
                 c.sendall(struct.pack("!I", 1)); c.close(); return
             op = req.get("op"); payload = req.get("payload", {})
@@ -170,22 +203,50 @@ class RLNController(app_manager.RyuApp):
 
     # --- builders ---
     def _ensure_groups(self, dp, groups):
+        # for g in groups:
+        #     gid = g["group_id"]
+        #     acts = self._actions_from_spec(dp, g.get("actions", []))
+        #     buckets = [parser.OFPBucket(actions=acts)]
+        #     req = parser.OFPGroupMod(datapath=dp, command=ofp.OFPGC_ADD,
+        #                              type_=ofp.OFPGT_INDIRECT, group_id=gid, buckets=buckets)
+        #     dp.send_msg(req)
+
         for g in groups:
             gid = g["group_id"]
-            acts = self._actions_from_spec(dp, g.get("actions", []))
-            buckets = [parser.OFPBucket(actions=acts)]
-            req = parser.OFPGroupMod(datapath=dp, command=ofp.OFPGC_ADD,
-                                     type_=ofp.OFPGT_INDIRECT, group_id=gid, buckets=buckets)
-            dp.send_msg(req)
+            # Map group index to "allow probability" as  gid / (num_groups-1)
+            # You can pass num_groups in payload, or just assume a fixed 20 (matches marl default).
+            num_groups = 20
+            allow_p = float(gid) / float(max(1, num_groups - 1))
+            # Allow allow_p * NOMINAL, drop rest
+            self._ensure_meter(dp, meter_id=1000 + gid, kbps=int(NOMINAL_KBPS * allow_p))
+
+    # def _flow_write_actions(self, dp, spec):
+    #     prio = spec.get("priority", 1)
+    #     table = spec.get("table", 0)
+    #     match = self._match_from_spec(spec.get("match", {}))
+    #     actions = self._actions_from_spec(dp, spec.get("actions", []))
+    #     inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+    #     dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=table, priority=prio,
+    #                                   match=match, instructions=inst, idle_timeout=30))
 
     def _flow_write_actions(self, dp, spec):
+        meter_id = getattr(self, "_pending_meter_id", None)
+        if meter_id is not None:
+            inst.insert(0, parser.OFPInstructionMeter(meter_id))
+            self._pending_meter_id = None
+
         prio = spec.get("priority", 1)
         table = spec.get("table", 0)
         match = self._match_from_spec(spec.get("match", {}))
         actions = self._actions_from_spec(dp, spec.get("actions", []))
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        # If actions included a PDROP_LEGACY pnum or a group index, attach a meter
+        meter_id = spec.get("meter_id")
+        if meter_id is not None:
+            inst.insert(0, parser.OFPInstructionMeter(meter_id))
         dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=table, priority=prio,
-                                      match=match, instructions=inst, idle_timeout=30))
+                                    match=match, instructions=inst, idle_timeout=30))
+
 
     def _rewrite_src_to_controller(self, dp, spec):
         prio = spec.get("priority", 1)
@@ -217,20 +278,44 @@ class RLNController(app_manager.RyuApp):
             else:    kw["ipv4_dst"] = val
         return parser.OFPMatch(**kw)
 
+    # def _actions_from_spec(self, dp, acts):
+    #     out = []
+    #     for a in acts:
+    #         t = a["type"]
+    #         if t == "OUTPUT":
+    #             port = a["port"]
+    #             if port == "CONTROLLER": out.append(parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER))
+    #             elif port == "FLOOD":    out.append(parser.OFPActionOutput(ofp.OFPP_FLOOD))
+    #             elif port == "NORMAL":   out.append(parser.OFPActionOutput(ofp.OFPP_NORMAL))
+    #             else:                    out.append(parser.OFPActionOutput(int(port)))
+    #         elif t == "GROUP":
+    #             out.append(parser.OFPActionGroup(a["group_id"]))
+    #         elif t == "PDROP":
+    #             # Approximate probabilistic drop: map desired probability into a meter or sample
+    #             # Simplest: emulate by sampling at app level; better: use a meter band drop. Placeholder:
+    #             pass
+    #     return out
+
+
     def _actions_from_spec(self, dp, acts):
         out = []
+        # default: None; filled if we see PDROP/PDROP_LEGACY
+        self._pending_meter_id = None
         for a in acts:
             t = a["type"]
             if t == "OUTPUT":
-                port = a["port"]
-                if port == "CONTROLLER": out.append(parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER))
-                elif port == "FLOOD":    out.append(parser.OFPActionOutput(ofp.OFPP_FLOOD))
-                elif port == "NORMAL":   out.append(parser.OFPActionOutput(ofp.OFPP_NORMAL))
-                else:                    out.append(parser.OFPActionOutput(int(port)))
+                ...
             elif t == "GROUP":
                 out.append(parser.OFPActionGroup(a["group_id"]))
+                # If your group_id encodes prob group, also meter on same id:
+                gid = a["group_id"]
+                self._pending_meter_id = 1000 + int(gid)
             elif t == "PDROP":
-                # Approximate probabilistic drop: map desired probability into a meter or sample
-                # Simplest: emulate by sampling at app level; better: use a meter band drop. Placeholder:
-                pass
+                gid = a.get("group_index", 0)
+                self._pending_meter_id = 1000 + int(gid)
+            elif t == "PDROP_LEGACY":
+                # Map 0xffffffff..0x0 to ~[0..1] allowance; keep a coarse mapping
+                pnum = int(a.get("pnum", 0xffffffff))
+                gid = int(round((pnum / 0xffffffff) * 19))  # 20 groups
+                self._pending_meter_id = 1000 + gid
         return out
