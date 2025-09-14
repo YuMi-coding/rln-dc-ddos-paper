@@ -179,7 +179,11 @@ def marlExperiment(
     spiffy_expansion_factor: float = 5.0,
 
     broken_math: bool = False,
-    num_drop_groups: int = 20,
+    num_drop_groups: int = 20,    
+    
+    
+    interactive_cli_pre: bool = False,
+    interactive_cli_post: bool = True,
 ):
 
     # --------------- Agent selection ----------------
@@ -1130,6 +1134,10 @@ def marlExperiment(
 
         alive = True
         executeRouteQueue()
+        # --- ADDED: optional pre-run Mininet CLI ---
+        if interactive_cli_pre:
+            print("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
+            CLI(net)
 
         print(monitored_links)
         mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
@@ -1668,6 +1676,11 @@ def marlExperiment(
 
         print("good:", last_traffic_ratio, ", g_reward:", g_reward, ", selected:", reward)
 
+        # --- ADDED: optional post-run Mininet CLI ---
+        if interactive_cli_post:
+            print("[INFO] Post-run Mininet CLI. Inspect results, then 'exit' to clean up.")
+            CLI(net)
+
         mon_cmd.stdin.close()
 
         if bw_sock is not None:
@@ -1697,3 +1710,23 @@ def marlExperiment(
         next_ip[:] = [1]
 
     return (rewards, good_traffic_percents, total_loads, store_sarsas, random.getstate(), action_comps)
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post",
+                    help="Open Mininet CLI: pre-run, post-run (default), both, or none.")
+    ap.add_argument("--episodes", type=int, default=1)
+    ap.add_argument("--episode-length", type=int, default=5000)
+    args = ap.parse_args()
+
+    cli_pre  = args.cli in ("pre", "both")
+    cli_post = args.cli in ("post", "both")
+
+    marlExperiment(
+        episodes=args.episodes,
+        episode_length=args.episode_length,
+        interactive_cli_pre=cli_pre,
+        interactive_cli_post=cli_post,
+    )

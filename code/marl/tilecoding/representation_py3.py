@@ -381,10 +381,12 @@ class TileCoding(Projector):
             state = state.reshape((1, -1))
 
         if self.bias_term:
-            indices = np.hstack(
-                chain((t(state) for t in self.tilings),
-                      [np.zeros((state.shape[0], 1), dtype=int)])
-            ) + self.index_offset
+            parts = [t(state) for t in self.tilings]
+            if hasattr(self, "extra_tilings") and self.extra_tilings is not None:
+                parts.append(self.extra_tilings(state))
+
+            # Shape we want: (batch, n_tilings, n_dims)
+            indices = np.stack(parts, axis=1)
         else:
             indices = np.hstack([t(state) for t in self.tilings]) + self.index_offset
 
@@ -443,8 +445,12 @@ class IdentityHash(Hashing):
             idx = np.remainder(indices, self.dims)
         else:
             idx = np.clip(indices, 0, self.dims - 1)
-        return np.sum(idx * self.dim_offset, axis=1).astype(int)
+        # idx should be (batch, n_tilings, n_dims); dim_offset is (1,1,n_dims)
+        if idx.ndim == 3 and idx.shape[-1] != self.dim_offset.shape[-1]:
+            # If idx is (batch, dims, n_tilings), transpose to (batch, n_tilings, dims)
+            idx = np.transpose(idx, (0, 2, 1))
 
+        return np.sum(idx * self.dim_offset, axis=2).astype(int)
 
 ################## RBF IMPLEMENTATION ########################################
 class RBFCoding(Projector):
