@@ -1014,6 +1014,8 @@ def marlExperiment(
     old_hosts = []
 
     for ep in range(episodes):
+
+        last_iter_snapshot = {"good": 0.0, "g_reward": 0.0, "selected": 0.0}
         # --- NEW: per-episode confusion counts (we'll evaluate using the last prediction per host) ---
         ep_counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
         # --- NEW: per-episode logs & metrics ---
@@ -1248,6 +1250,7 @@ def marlExperiment(
             try:
                 bw_sock.sendall(struct.pack("=I", 0))  # zero flows
                 # expect 8 bytes header back (time_ns); if this times out, protocol still mismatched
+                time.sleep(0.1)
                 _hdr = bw_sock.recv(8)
             except Exception as e:
                 print("[bwmon] warm-up failed:", e)
@@ -1258,66 +1261,192 @@ def marlExperiment(
             bytes_packer = struct.Struct("=Q")
             fm_packer = struct.Struct("=q6Q6fI4x")
 
-            def ask_stats(flows, n_ifs, n_agents):
-                intime = time.time()
-                bw_sock.sendall(sz_packer.pack(len(flows)))
-                flow_data = b"".join(ip_packer.pack(f) for f in flows)
-                outtime = time.time()
-                bw_sock.sendall(flow_data)
-                if print_times: print("interlude:", outtime - intime)
+            # def ask_stats(flows, n_ifs, n_agents):
+            #     intime = time.time()
+            #     bw_sock.sendall(sz_packer.pack(len(flows)))
+            #     flow_data = b"".join(ip_packer.pack(f) for f in flows)
+            #     outtime = time.time()
+            #     bw_sock.sendall(flow_data)
+            #     if print_times: print("interlude:", outtime - intime)
 
-                def read_n(n, recvd):
-                    deadline = time.time() + 5.0
-                    while len(recvd) < n:
-                        if time.time() > deadline:
-                            raise TimeoutError(f"bwmon read timeout waiting for {n} bytes")
+            #     def read_n(n, recvd):
+            #         deadline = time.time() + 5.0
+            #         while len(recvd) < n:
+            #             if time.time() > deadline:
+            #                 raise TimeoutError(f"bwmon read timeout waiting for {n} bytes")
+            #             try:
+            #                 t = bw_sock.recv(4096)
+            #             except socket.timeout:
+            #                 continue
+            #             except socket.error as e:
+            #                 err = e.args[0]
+            #                 if err in (errno.EAGAIN, errno.EWOULDBLOCK):
+            #                     continue
+            #                 else:
+            #                     print("socket read error"); sys.exit(1)
+            #             else:
+            #                 recvd += t
+            #         return recvd
+
+            #     recvd = b""
+            #     recvd = read_n(8, recvd)
+            #     (time_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
+
+            #     list_sz = n_ifs * 8 * 2
+            #     full = list_sz # * 2
+            #     recvd = read_n(full, recvd)
+
+            #     def mbpsify(bts): return 8000*float(bts)/time_ns
+
+            #     # parse only 2*n_ifs counters, not 4*n_ifs
+            #     goods, bads = [], []
+            #     for i in range(n_ifs * 2):
+            #         idx = i * 8
+            #         (val,) = bytes_packer.unpack(recvd[idx: idx+8])
+            #         # build (in_good,in_bad),(out_good,out_bad),...
+            #         if i % 2 == 0:
+            #             goods.append(val)
+            #         else:
+            #             bads.append(val)
+            #     # unfused_load_mbps = [pair for pair in zip(goods, bads)]
+            #     unfused_load_mbps = []
+            #     for k in range(n_ifs):
+            #         ig, ib = goods[k], bads[k]         # IN pair
+            #         og, ob = goods[k + 0], bads[k + 0] # if bwmon orders IN then OUT separately, adjust indexing accordingly
+            #     pairs = []
+            #     for i in range(0, n_ifs*2, 1):
+            #         (val,) = bytes_packer.unpack(recvd[i*8:(i+1)*8])
+            #         pairs.append(val)
+            #     recvd = recvd[full:]
+
+            #     parsed_flows = []
+            #     for _ in range(n_agents):
+            #         recvd = read_n(4, recvd)
+            #         (n_flow_entries,) = sz_packer.unpack(recvd[:4]); recvd = recvd[4:]
+            #         l_flows = []
+            #         stat_struct_len = 88
+            #         for _ in range(n_flow_entries):
+            #             recvd = read_n(stat_struct_len, recvd)
+            #             datas = list(fm_packer.unpack(recvd[:stat_struct_len]))
+            #             recvd = recvd[stat_struct_len:]
+            #             if datas[-1] != 0:
+            #                 l_flows.append((datas[-1], tuple(datas[0:5] + datas[7:9] + [datas[5]] + datas[9:11] + [datas[6]] + datas[11:13])))
+            #         parsed_flows.append(l_flows)
+            #     return (time_ns, unfused_load_mbps, parsed_flows)
+
+            def ask_stats(flows, n_ifs, n_agents):
+                # 0) send flow list
+                bw_sock.sendall(sz_packer.pack(len(flows)))
+                if flows:
+                    bw_sock.sendall(b"".join(ip_packer.pack(f) for f in flows))
+
+                # NEW: tick the daemon to produce one snapshot
+                try:
+                    bw_sock.sendall(b"\n")
+                except BrokenPipeError:
+                    pass
+
+                def read_n_at_least(n_min, n_try, recvd, timeout=10.0):
+                    deadline = time.time() + timeout
+                    while len(recvd) < n_min and time.time() < deadline:
                         try:
-                            t = bw_sock.recv(4096)
-                        except socket.timeout:
+                            chunk = bw_sock.recv(4096)
+                        except (socket.timeout, BlockingIOError):
                             continue
-                        except socket.error as e:
-                            err = e.args[0]
-                            if err in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        except OSError as e:
+                            if getattr(e, "errno", None) in (errno.EAGAIN, errno.EWOULDBLOCK):
                                 continue
-                            else:
-                                print("socket read error"); sys.exit(1)
-                        else:
-                            recvd += t
+                            raise
+                        if not chunk:
+                            break
+                        recvd += chunk
+                    # opportunistically top up to n_try if available
+                    while len(recvd) < n_try and time.time() < deadline:
+                        try:
+                            chunk = bw_sock.recv(4096)
+                            if not chunk:
+                                break
+                            recvd += chunk
+                        except Exception:
+                            break
                     return recvd
 
                 recvd = b""
-                recvd = read_n(8, recvd)
+
+                # 1) time_ns
+                recvd = read_n_at_least(8, 8, recvd)
+                if len(recvd) < 8:
+                    raise TimeoutError("bwmon read timeout waiting for time_ns (8 bytes)")
                 (time_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
+                if time_ns <= 0:
+                    time_ns = 1
 
-                list_sz = n_ifs * 8 * 2
-                full = list_sz * 2
-                recvd = read_n(full, recvd)
+                # 2) counters (accept either 4*n_ifs or 2*n_ifs uint64s)
+                need_AB = n_ifs * 8 * 4
+                need_C  = n_ifs * 8 * 2
+                recvd = read_n_at_least(need_C, need_AB, recvd)
+                have = len(recvd)
 
-                def mbpsify(bts): return 8000*float(bts)/time_ns
+                def mbpsify(u64b): return 8000.0 * float(u64b) / float(time_ns)
+                unfused_load_mbps = []
 
-                goods, bads = [], []
-                for i in range(n_ifs * 2 * 2):
-                    index = i * 8
-                    (val,) = bytes_packer.unpack(recvd[index: index+8])
-                    if i < (n_ifs * 2): goods.append(mbpsify(val))
-                    else: bads.append(mbpsify(val))
-                unfused_load_mbps = [pair for pair in zip(goods, bads)]
-                recvd = recvd[full:]
+                if have >= need_AB:
+                    data = recvd[:need_AB]; recvd = recvd[need_AB:]
+                    vals = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(4*n_ifs)]
 
+                    # Try interleaved: [IN_g, IN_b, OUT_g, OUT_b] * n_ifs
+                    inter = []
+                    nz_out = 0
+                    for i in range(n_ifs):
+                        in_g, in_b, out_g, out_b = vals[4*i:4*i+4]
+                        inter.append((mbpsify(in_g),  mbpsify(in_b)))
+                        inter.append((mbpsify(out_g), mbpsify(out_b)))
+                        if (out_g | out_b) != 0:
+                            nz_out += 1
+
+                    # Try split goods/bads: first 2*n_ifs goods, next 2*n_ifs bads
+                    goods, bads = vals[:2*n_ifs], vals[2*n_ifs:]
+                    split = [(mbpsify(goods[j]), mbpsify(bads[j])) for j in range(2*n_ifs)]
+
+                    unfused_load_mbps = inter if nz_out > 0 else split
+
+                elif have >= need_C:
+                    data = recvd[:need_C]; recvd = recvd[need_C:]
+                    totals = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(2*n_ifs)]
+                    unfused_load_mbps = [(mbpsify(t), 0.0) for t in totals]
+                else:
+                    raise TimeoutError(f"bwmon read timeout waiting for counters "
+                                    f"(got {have} bytes, need at least {need_C})")
+
+                # 3) (optional) per-agent flow blocks
                 parsed_flows = []
                 for _ in range(n_agents):
-                    recvd = read_n(4, recvd)
+                    recvd = read_n_at_least(4, 4, recvd)
+                    if len(recvd) < 4:
+                        parsed_flows.append([])
+                        continue
                     (n_flow_entries,) = sz_packer.unpack(recvd[:4]); recvd = recvd[4:]
-                    l_flows = []
-                    stat_struct_len = 88
+                    need = n_flow_entries * 88
+                    recvd = read_n_at_least(need, need, recvd)
+                    if len(recvd) < need:
+                        parsed_flows.append([])
+                        recvd = b""
+                        continue
+                    l_flows, off = [], 0
                     for _ in range(n_flow_entries):
-                        recvd = read_n(stat_struct_len, recvd)
-                        datas = list(fm_packer.unpack(recvd[:stat_struct_len]))
-                        recvd = recvd[stat_struct_len:]
+                        chunk = recvd[off:off+88]; off += 88
+                        datas = list(fm_packer.unpack(chunk))
                         if datas[-1] != 0:
-                            l_flows.append((datas[-1], tuple(datas[0:5] + datas[7:9] + [datas[5]] + datas[9:11] + [datas[6]] + datas[11:13])))
+                            l_flows.append(
+                                (datas[-1],
+                                tuple(datas[0:5] + datas[7:9] + [datas[5]] + datas[9:11] + [datas[6]] + datas[11:13]))
+                            )
+                    recvd = recvd[need:]
                     parsed_flows.append(l_flows)
+
                 return (time_ns, unfused_load_mbps, parsed_flows)
+
+
 
         else:
             mon_cmd = server_switch.popen(
@@ -1365,56 +1494,48 @@ def marlExperiment(
                 mon_cmd.stdin.write(b"\n")
                 mon_cmd.stdin.flush()
 
-                line = mon_cmd.stdout.readline().decode().strip()
+                # First line: e.g.
+                # 862420385ns, 18216 12804, 817512 574628, ...
+                line = mon_cmd.stdout.readline().decode(errors="replace").strip()
                 if not line:
-                    # If nothing came back, return zeros defensively
                     time_ns = 1
-                    unfused_load_mbps = [(0.0, 0.0) for _ in range(n_ifs * 2)]  # [in0, out0, in1, out1, ...]
-                    parsed_flows = [[] for _ in range(n_agents)]
-                    return (time_ns, unfused_load_mbps, parsed_flows)
+                    unfused_load_mbps = [(0.0, 0.0) for _ in range(n_ifs * 2)]
+                    return (time_ns, unfused_load_mbps, [[] for _ in range(n_agents)])
 
-                # Example line:
-                # 862420385ns, 18216 12804, 817512 574628, 18150 12672, 814550 568704, ...
-                parts = [p.strip() for p in line.split(",")]
-                # first token is like "862420385ns"
+                parts = [p.strip() for p in line.split(",") if p.strip()]
                 ttok = parts[0]
                 if ttok.endswith("ns"):
                     ttok = ttok[:-2]
-                time_ns = int(ttok) if ttok.isdigit() else 1
+                try:
+                    time_ns = int(ttok)
+                except ValueError:
+                    time_ns = 1
 
-                # For each interface, stdout prints two pairs: (IN good,bad), (OUT good,bad)
-                # So total tokens expected after the time token: 2 * n_ifs entries.
-                in_out_pairs = []
+                # Then we expect 2*n_ifs pairs: (IN good bad), (OUT good bad), ...
+                pairs = []
                 for p in parts[1:]:
-                    if not p:
-                        continue
-                    ab = p.split()
-                    if len(ab) != 2:
-                        # tolerate odd spacing
-                        ab = [x for x in ab if x]
-                    if len(ab) == 2:
+                    toks = [t for t in p.split() if t]
+                    if len(toks) >= 2:
                         try:
-                            a = int(ab[0]); b = int(ab[1])
+                            a = int(toks[0]); b = int(toks[1])
                         except ValueError:
                             a = b = 0
-                        in_out_pairs.append((a, b))
+                        pairs.append((a, b))
 
-                # If fewer tokens arrived (race), pad with zeros
-                while len(in_out_pairs) < 2 * n_ifs:
-                    in_out_pairs.append((0, 0))
+                # pad if short
+                while len(pairs) < 2 * n_ifs:
+                    pairs.append((0, 0))
 
-                # Convert to Mbps using the same formula as socket mode
-                def mbpsify(bts):  # bts = bytes in the sample window
+                def mbpsify(bts):  # bytes over window (ns) -> Mb/s
                     return 8000.0 * float(bts) / max(1, time_ns)
 
-                # Build unfused_load_mbps in the same shape that the rest of your code expects:
-                # [ (in_good,in_bad), (out_good,out_bad), (in_good,in_bad), (out_good,out_bad), ... ]
-                unfused_load_mbps = [(mbpsify(g), mbpsify(b)) for (g, b) in in_out_pairs[: 2 * n_ifs]]
+                unfused_load_mbps = [(mbpsify(g), mbpsify(b)) for (g, b) in pairs[: 2 * n_ifs]]
 
-                # No per-agent flow blocks in stdout mode → return empty lists per learner
+                # No per-agent flow telemetry available in stdout mode
                 parsed_flows = [[] for _ in range(n_agents)]
 
                 return (time_ns, unfused_load_mbps, parsed_flows)
+
 
         server_procs = []
         for i, dest_node in enumerate(dests):
@@ -1947,9 +2068,15 @@ def marlExperiment(
             good_traffic_percents[-1].append(last_traffic_ratio)
             rewards[-1].append(g_reward)
             total_loads[-1].append(total_mbps[0])
+            last_iter_snapshot["good"] = float(last_traffic_ratio)
+            last_iter_snapshot["g_reward"] = float(g_reward)
+            last_iter_snapshot["selected"] = float(reward)
 
-        print("good:", last_traffic_ratio, ", g_reward:", g_reward, ", selected:", reward)
+        # print("good:", last_traffic_ratio, ", g_reward:", g_reward, ", selected:", reward)
 
+        print(f"good: {last_iter_snapshot['good']} , "
+      f"g_reward: {last_iter_snapshot['g_reward']} , "
+      f"selected: {last_iter_snapshot['selected']}")
         # Only drop into CLI after the very last episode
         is_last_episode = (ep == episodes - 1)
         if interactive_cli_post and is_last_episode:
@@ -2080,10 +2207,10 @@ if __name__ == "__main__":
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,
         interactive_cli_post=cli_post,
-        actions_target_flows=True,     # per-flow decisions needed for metrics
+        actions_target_flows=False,     # per-flow decisions needed for metrics
         log_actions=True,
         allow_threshold=0.5,
         bw_mon_socketed=False,
-        unix_sock=False,
+        unix_sock=True,
         log_dir=args.log_dir,          # or hardcode your data dir
     )
