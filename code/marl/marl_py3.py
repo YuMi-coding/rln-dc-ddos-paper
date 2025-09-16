@@ -17,6 +17,7 @@ import time
 from contextlib import closing
 from subprocess import PIPE, Popen
 from typing import Any, Dict, List, Optional, Tuple
+import threading
 
 import networkx as nx
 import numpy as np
@@ -27,6 +28,71 @@ from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController, Switch
 from mininet.topo import Topo
 
+# --- logging setup (console + file) ---
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+import builtins
+
+LOG = logging.getLogger("marl")
+LOG.propagate = False  # don't duplicate to root
+
+def setup_logging(log_dir: str, level: str = "INFO") -> str:
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile = os.path.join(log_dir, f"run_{ts}.log")
+
+    # parse level
+    lvl = getattr(logging, str(level).upper(), logging.INFO)
+
+    # formatter (file is verbose; console is shorter)
+    file_fmt = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s [%(process)d] %(filename)s:%(lineno)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    con_fmt = logging.Formatter(
+        fmt="%(levelname)s: %(message)s"
+    )
+
+    # handlers
+    LOG.setLevel(logging.DEBUG)  # logger accepts everything; handlers filter
+    # file: rotate at ~10MB, keep 3
+    fh = RotatingFileHandler(logfile, maxBytes=10_000_000, backupCount=3)
+    fh.setLevel(logging.DEBUG)     # capture everything to file
+    fh.setFormatter(file_fmt)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(lvl)               # console obeys --log-level
+    ch.setFormatter(con_fmt)
+
+    # reset handlers if re-run
+    LOG.handlers[:] = []
+    LOG.addHandler(fh)
+    LOG.addHandler(ch)
+
+    # shadow print inside this module → logs at INFO
+    def _print_to_log(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "")
+        msg = sep.join(str(a) for a in args) + end
+        LOG.info(msg)
+
+    # NOTE: this shadows print only in this module (not globally)
+    globals()["print"] = _print_to_log
+
+    LOG.info("logging initialized; file=%s level=%s", logfile, level)
+    return logfile
+
+def tee_process_stdout(proc, prefix: str):
+    def _reader():
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                LOG.info("%s%s", prefix, raw.decode(errors="replace").rstrip("\n"))
+        except Exception:
+            LOG.exception("stdout tee failed for %s", prefix)
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    return t
 # RL & state machines (your local modules)
 from sarsa_py3 import SarsaLearner, QLearner
 from spf_py3 import *  # SpfMachine, MarlMachine, etc.
@@ -1049,6 +1115,19 @@ def marlExperiment(
 
         dest_from_ip = {dest[0][0]: dest for dest in dests}
 
+        def resolve_dest_label(dst_ip_any):
+            # Accept int or str; normalize to dotted-quad string and map to dest label
+            if isinstance(dst_ip_any, (int, np.integer)):
+                try:
+                    dst_ip_s = socket.inet_ntoa(struct.pack("!I", int(dst_ip_any)))
+                except Exception:
+                    return dests[0]  # fallback to first dest
+            elif isinstance(dst_ip_any, str):
+                dst_ip_s = dst_ip_any
+            else:
+                return dests[0]
+            return dest_from_ip.get(dst_ip_s, dests[0])
+
         dest_map = {}
         for (node, _sarsa, _leader) in actors:
             for dest in dests:
@@ -1082,6 +1161,8 @@ def marlExperiment(
                 stderr=sys.stderr,
                 env=env,
             )
+            # tee_process_stdout(ctl_proc, "[ctl] ") # commented out because the controller program says nothing
+            
             time.sleep(1.0)  # small grace for OVS to connect
 
 
@@ -1219,7 +1300,8 @@ def marlExperiment(
         executeRouteQueue()
         # --- ADDED: optional pre-run Mininet CLI ---
         if interactive_cli_pre:
-            print("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
+            # print("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
+            LOG.warning("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
             CLI(net)
 
         print("monitored_links raw:", monitored_links)
@@ -1235,11 +1317,13 @@ def marlExperiment(
         bw_sock = None
         if bw_mon_socketed:
             bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + monitored_links
-            print("starting bwmon as:", " ".join(bwmon_command))
+            # print("starting bwmon as:", " ".join(bwmon_command))
+            LOG.info("starting bwmon as: %s", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
                 bwmon_command,
                 stdin=PIPE, stderr=sys.stderr
             )
+            tee_process_stdout(mon_cmd, "[bwmon] ")
             time.sleep(0.5)
             if unix_sock:
                 bw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1452,11 +1536,13 @@ def marlExperiment(
 
         else:
             bwmon_command = ["../marl-bwmon/marl-bwmon"] + monitored_links
-            print("starting bwmon as:", " ".join(bwmon_command))
+            # print("starting bwmon as:", " ".join(bwmon_command))
+            LOG.info("starting bwmon as: %s", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
                 bwmon_command,
                 stdin=PIPE, stdout=PIPE, stderr=sys.stderr
             )
+            tee_process_stdout(mon_cmd, "[bwmon] ")
             # def ask_stats(_flows, _n_ifs, _n_agents):
             #     mon_cmd.stdin.write(b"\n")
             #     mon_cmd.stdin.flush()
@@ -1580,6 +1666,7 @@ def marlExperiment(
                 cmds.append(cmd)
                 for cmd in cmds:
                     server_procs.append(dest.popen(cmd, stdin=PIPE, stderr=sys.stderr))
+                    tee_process_stdout(server_procs[-1], f"[srv{dest_node[0][0]}] ")
 
         for (host, good, bw, link, ip, extern_no, sm) in all_hosts:
             target_dest = dests[0] if len(dests) == 1 else dests[random.randint(0, len(dests)-1)]
@@ -1618,6 +1705,7 @@ def marlExperiment(
                 env_new = os.environ.copy()
                 env_new["RUST_BACKTRACE"] = "1"
                 host_procs.append(host.popen(cmd, stdin=PIPE, stderr=sys.stdout, env=env_new))
+                tee_process_stdout(host_procs[-1], f"[hst{ip}] ")
 
         time.sleep(3)
 
@@ -1698,13 +1786,18 @@ def marlExperiment(
             time.sleep(dt)
 
             preask = time.time()
-            if i % 20 == 0:
-                print(f"[debug] query_size={len(flows_to_query)} example={next(iter(flows_to_query)) if flows_to_query else None}")
+            if i % 50 == 0:
+                 LOG.debug("[debug] query_size=%d example=%s",
+              len(flows_to_query),
+              next(iter(flows_to_query)) if flows_to_query else None)
             (time_ns, unfused_load_mbps, parsed_flows) = ask_stats(list(flows_to_query), len(monitored_links), len(learner_pos))
-            if i % 20 == 0:
-                print(f"[debug] total_flow_entries={sum(len(x) for x in parsed_flows)} per_agent={[len(x) for x in parsed_flows]}")
+            if i % 50 == 0:
+                LOG.debug("[debug] total_flow_entries=%d per_agent=%s",
+                          sum(len(x) for x in parsed_flows),
+                          [len(x) for x in parsed_flows])
             postask = time.time()
-            if print_times: print("total:", postask - preask)
+            if print_times: 
+                print("total:", postask - preask)
 
             def mbpsify(bts): return 8000*float(bts)/time_ns
 
@@ -1760,8 +1853,10 @@ def marlExperiment(
 
             last_traffic_ratio = min(dest_sum_data[0]/bw_all[0], 1.0)
             if not (i % 10):
-                print("\titer {}/{}, good:{}, load:{:.2f} ({:.2f},{:.2f})".format(i, episode_length, last_traffic_ratio, dest_sum_data[0] + dest_sum_data[1], *direction_sum))
-                
+                LOG.info("\titer %d/%d, good:%s, load:%.2f (%.2f,%.2f)",
+                i, episode_length, last_traffic_ratio,
+                dest_sum_data[0] + dest_sum_data[1], *direction_sum)
+
             intime = time.time()
             for learner_no, (node_label, sarsa, leader_nodes) in enumerate(actors):
                 node = vertex_map[node_label]
@@ -1988,15 +2083,20 @@ def marlExperiment(
                                     narrowing_in_use[0] -= 1
                                     allow_update_narrowing = True
                                     allow_action_narrowing = narrowing_in_use[0] > 0
+                                dest_label = resolve_dest_label(ip_pair[1])
                                 (would_choose, new_vals, z_vec) = s.update(
                                     state,
-                                    l_rewards[dest_from_ip[ip_pair[1]]],
+                                    l_rewards[dest_label],
                                     (st, dat[1], z),
                                     decay=False,
                                     delta_space=[i] if record_deltas_in_times else None,
                                     action_narrowing=None if not allow_action_narrowing else narrowing_in_use[1],
                                     update_narrowing=None if not allow_update_narrowing else narrowing_in_use[1],
                                 )
+                                if isinstance(ip_pair[1], (int, np.integer)) and ip_pair[1] == 167772161:
+                                    LOG.debug("dst %s -> %s", ip_pair[1],
+                                                socket.inet_ntoa(struct.pack('!I', int(ip_pair[1]))))
+
                             else:
                                 (would_choose, new_vals, z_vec) = s.bootstrap(state)
                                 need_decay = False
@@ -2162,43 +2262,20 @@ def marlExperiment(
     return (rewards, good_traffic_percents, total_loads, store_sarsas, random.getstate(), action_comps)
 
 
-# if __name__ == "__main__":
-#     import argparse
-#     ap = argparse.ArgumentParser()
-#     ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post",
-#                     help="Open Mininet CLI: pre-run, post-run (default), both, or none.")
-#     ap.add_argument("--episodes", type=int, default=1)
-#     ap.add_argument("--episode-length", type=int, default=5000)
-#     args = ap.parse_args()
-
-#     cli_pre  = args.cli in ("pre", "both")
-#     cli_post = args.cli in ("post", "both")
-
-#     marlExperiment(
-#         model = "nginx",
-#         submodel="http",
-#         use_controller=True,
-#         episodes=args.episodes,
-#         episode_length=args.episode_length,
-#         interactive_cli_pre=cli_pre,
-#         interactive_cli_post=cli_post,
-#         actions_target_flows=True,   # <— IMPORTANT for per-flow decisions
-#         log_actions=True,
-#         bw_mon_socketed=True,   # <<< important
-#         unix_sock=True,         # default in your code
-#         log_dir="../data/20250914/",  # or wherever you want the logs to land
-#         allow_threshold=0.5,         # tune to taste
-#     )
-
-
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--cli", choices=["none", "pre", "post", "both"], default="post")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--episode-length", type=int, default=5000)
-    ap.add_argument("--log-dir", type=str, default="logs")  # <— add this arg if you want
+    ap.add_argument("--log-dir", type=str, default="logs")
+    ap.add_argument("--log-level", type=str, default="INFO",
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     args = ap.parse_args()
+
+    # init logging (console + file) before anything else
+    log_file = setup_logging(args.log_dir, args.log_level)
+    LOG.info("log file: %s", log_file)
 
     cli_pre  = args.cli in ("pre", "both")
     cli_post = args.cli in ("post", "both")
@@ -2211,10 +2288,10 @@ if __name__ == "__main__":
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,
         interactive_cli_post=cli_post,
-        actions_target_flows=True,     # per-flow decisions needed for metrics
+        actions_target_flows=True,
         bw_mon_socketed=True,
         log_actions=True,
         allow_threshold=0.5,
         unix_sock=True,
-        log_dir=args.log_dir,          # or hardcode your data dir
+        log_dir=args.log_dir,
     )
