@@ -1234,29 +1234,31 @@ def marlExperiment(
 
         bw_sock = None
         if bw_mon_socketed:
+            bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + bw_ifaces
+            print("starting bwmon as:", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
-                ["../marl-bwmon/marl-bwmon", "-s"] + bw_ifaces,
+                bwmon_command,
                 stdin=PIPE, stderr=sys.stderr
             )
             time.sleep(0.5)
             if unix_sock:
                 bw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                bw_sock.connect("bwmon-sock")
+                bw_sock.connect("/tmp/bwmon-sock")
                 bw_sock.settimeout(3.0)  # after connect
             else:
                 bw_sock = socket.create_connection(("127.0.0.1", stats_port))
             bw_sock.setblocking(0)
 
             try:
-                bw_sock.sendall(struct.pack("=I", 0))  # zero flows
+                bw_sock.sendall(struct.pack("!I", 0))  # zero flows
                 # expect 8 bytes header back (time_ns); if this times out, protocol still mismatched
                 time.sleep(0.1)
                 _hdr = bw_sock.recv(8)
             except Exception as e:
                 print("[bwmon] warm-up failed:", e)
 
-            sz_packer = struct.Struct("=I")
-            ip_packer = struct.Struct("=I")
+            sz_packer = struct.Struct("!I")
+            ip_packer = struct.Struct("!I")
             time_packer = struct.Struct("=q")
             bytes_packer = struct.Struct("=Q")
             fm_packer = struct.Struct("=q6Q6fI4x")
@@ -1341,10 +1343,10 @@ def marlExperiment(
                     bw_sock.sendall(b"".join(ip_packer.pack(f) for f in flows))
 
                 # NEW: tick the daemon to produce one snapshot
-                try:
-                    bw_sock.sendall(b"\n")
-                except BrokenPipeError:
-                    pass
+                # try:
+                #     bw_sock.sendall(b"\n")
+                # except BrokenPipeError:
+                #     pass
 
                 def read_n_at_least(n_min, n_try, recvd, timeout=10.0):
                     deadline = time.time() + timeout
@@ -1449,8 +1451,10 @@ def marlExperiment(
 
 
         else:
+            bwmon_command = ["../marl-bwmon/marl-bwmon"] + bw_ifaces
+            print("starting bwmon as:", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
-                ["../marl-bwmon/marl-bwmon"] + bw_ifaces,
+                bwmon_command,
                 stdin=PIPE, stdout=PIPE, stderr=sys.stderr
             )
             # def ask_stats(_flows, _n_ifs, _n_agents):
@@ -2207,10 +2211,10 @@ if __name__ == "__main__":
         episode_length=args.episode_length,
         interactive_cli_pre=cli_pre,
         interactive_cli_post=cli_post,
-        actions_target_flows=False,     # per-flow decisions needed for metrics
+        actions_target_flows=True,     # per-flow decisions needed for metrics
+        bw_mon_socketed=True,
         log_actions=True,
         allow_threshold=0.5,
-        bw_mon_socketed=False,
         unix_sock=True,
         log_dir=args.log_dir,          # or hardcode your data dir
     )
