@@ -1179,7 +1179,7 @@ def marlExperiment(
         host_ip_mac_map = {}
         flows_to_query = set()
         for (host, good, bw, _, _, extern_no, sm) in all_hosts:
-            lhs = ip_to_int_native(host.IP())
+            lhs = ip_to_int(host.IP())
             host_ip_mac_map[lhs] = host.MAC()
             flows_to_query.add(lhs)
             (_a_node, _a_sarsa, a_leader) = actors[extern_no]
@@ -1227,14 +1227,14 @@ def marlExperiment(
         # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
 
         # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon", "-s"] + monitored_links, stdin=PIPE, stderr=sys.stderr)
-        bw_ifaces = [name.lstrip('!') for name in monitored_links]
+        # bw_ifaces = [name.lstrip('!') for name in monitored_links]
 
         # bw_mon_socketed = False # XXX mon_cmd is always socketed for now
         # unix_sock = True
 
         bw_sock = None
         if bw_mon_socketed:
-            bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + bw_ifaces
+            bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + monitored_links
             print("starting bwmon as:", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
                 bwmon_command,
@@ -1244,10 +1244,10 @@ def marlExperiment(
             if unix_sock:
                 bw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 bw_sock.connect("/tmp/bwmon-sock")
-                bw_sock.settimeout(3.0)  # after connect
+                bw_sock.settimeout(5.0)  # after connect
             else:
                 bw_sock = socket.create_connection(("127.0.0.1", stats_port))
-            bw_sock.setblocking(0)
+            # bw_sock.setblocking(0)
 
             try:
                 bw_sock.sendall(struct.pack("!I", 0))  # zero flows
@@ -1451,7 +1451,7 @@ def marlExperiment(
 
 
         else:
-            bwmon_command = ["../marl-bwmon/marl-bwmon"] + bw_ifaces
+            bwmon_command = ["../marl-bwmon/marl-bwmon"] + monitored_links
             print("starting bwmon as:", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
                 bwmon_command,
