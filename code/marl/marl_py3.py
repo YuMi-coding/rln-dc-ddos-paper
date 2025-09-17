@@ -134,6 +134,93 @@ def int_to_ip(ip_int: int) -> str:
 def ip_to_int_native(ip_str: str) -> int:
     # native-endian u32 (matches non-socketed code path)
     return struct.unpack("=I", socket.inet_aton(ip_str))[0]
+
+def _pick_narrowing_indices(s, always_include_global: bool):
+    # Returns either a list of indices (for action/update_narrowing) or None
+    mod = 1 if always_include_global else 0
+    tsc = int(getattr(s, "tiling_set_count", 0) or 0)
+
+    # If there are no tiles at all, give up gracefully.
+    if tsc <= 0:
+        return None
+
+    # Start with the bias/global tile if requested.
+    base = [0] if always_include_global else []
+
+    # If there are no non-bias tiles to sample, return bias-only (still valid).
+    if tsc <= mod:
+        return base if base else None
+
+    # Sample one non-bias tile in [mod, tsc-1]
+    idx = int(np.random.randint(mod, tsc))
+    return base + [idx]
+
+# --- monitor status reporter -------------------------------------------------
+class MonitorReporter:
+    """
+    Logs per-iteration monitor status and saves a CSV:
+      step,time_ns,iface,ingood_mbps,inbad_mbps,outgood_mbps,outbad_mbps,flows_0,...,flows_{N-1}
+    """
+    def __init__(self, log_dir: str, n_ifs: int, n_agents: int, episode: int, log_every: int = 1):
+        self.log = logging.getLogger("marl.status")
+        self.n_ifs = int(n_ifs)
+        self.n_agents = int(n_agents)
+        self.step = 0
+        self.log_every = max(1, int(log_every))
+        os.makedirs(log_dir, exist_ok=True)
+        self.path = os.path.join(log_dir, f"monitor_ep{episode:04d}.csv")
+        self._fp = open(self.path, "w", buffering=1)
+        header = ["step", "time_ns", "iface", "ingood_mbps", "inbad_mbps",
+                  "outgood_mbps", "outbad_mbps"] + [f"flows_{i}" for i in range(self.n_agents)]
+        self._fp.write(",".join(header) + "\n")
+
+    def tick(self, time_ns: int, unfused_load_mbps, parsed_flows):
+        """
+        unfused_load_mbps: list of length 2*n_ifs of (good, bad) Mb/s:
+            [ (IN_g,IN_b) for if0, (OUT_g,OUT_b) for if0, (IN_g,IN_b) for if1, ... ]
+        parsed_flows: list of per-agent flow lists
+        """
+        self.step += 1
+
+        # per-agent flow counts (for quick health checking)
+        flow_counts = [len(parsed_flows[i]) if i < len(parsed_flows) else 0
+                       for i in range(self.n_agents)]
+
+        # CSV rows: one per interface
+        for ifi in range(self.n_ifs):
+            ing, inb = unfused_load_mbps[2*ifi]
+            outg, outb = unfused_load_mbps[2*ifi + 1]
+            row = [str(self.step), str(int(time_ns)), str(ifi),
+                   f"{float(ing):.6f}", f"{float(inb):.6f}",
+                   f"{float(outg):.6f}", f"{float(outb):.6f}"] + [str(c) for c in flow_counts]
+            self._fp.write(",".join(row) + "\n")
+
+        # Console/file log (compact): total IN/OUT (good/bad) across ifaces + flow counts.
+        if (self.step % self.log_every) == 0:
+            tot_ing = sum(unfused_load_mbps[2*i][0] for i in range(self.n_ifs))
+            tot_inb = sum(unfused_load_mbps[2*i][1] for i in range(self.n_ifs))
+            tot_outg = sum(unfused_load_mbps[2*i+1][0] for i in range(self.n_ifs))
+            tot_outb = sum(unfused_load_mbps[2*i+1][1] for i in range(self.n_ifs))
+            self.log.info(
+                "[mon] step=%d t=%.3fms IN=(g=%.2f,b=%.2f) OUT=(g=%.2f,b=%.2f) flows=%s",
+                self.step, float(time_ns) / 1e6,
+                tot_ing, tot_inb, tot_outg, tot_outb,
+                "|".join(str(c) for c in flow_counts)
+            )
+
+            # Anomaly hints
+            if all(c == 0 for c in flow_counts):
+                self.log.warning("[mon] no per-flow entries this step (is bwmon producing flows? allowed set?)")
+            if time_ns <= 0:
+                self.log.warning("[mon] non-positive time_ns=%s (window duration fallback in effect)", time_ns)
+
+    def close(self):
+        try:
+            self._fp.close()
+        except Exception:
+            pass
+
+
 # ------------------------------------------------------------
 # Main experiment: Python-3 rewrite, twink/ofp5 replaced by
 # controller JSON ops; preserves original behavior/structure.
@@ -1145,6 +1232,14 @@ def marlExperiment(
             learner_pos[name] = len(learner_name)
             learner_name.append(name)
 
+        mon_reporter = MonitorReporter(
+            log_dir=log_dir,
+            n_ifs=len(monitored_links),
+            n_agents=len(learner_pos),
+            episode=ep,
+            log_every=1,     # log every step; bump to 5/10 if too chatty
+        )
+
         ctl_proc = None
         if use_controller:
             # ctl_proc = Popen(["ryu-manager", "controller_py3.py"], stdin=PIPE, stderr=sys.stderr)
@@ -1791,6 +1886,13 @@ def marlExperiment(
               len(flows_to_query),
               next(iter(flows_to_query)) if flows_to_query else None)
             (time_ns, unfused_load_mbps, parsed_flows) = ask_stats(list(flows_to_query), len(monitored_links), len(learner_pos))
+
+            # Timely status: log + CSV
+            try:
+                mon_reporter.tick(time_ns, unfused_load_mbps, parsed_flows)
+            except Exception as e:
+                LOG.exception("monitor reporter failed: %s", e)
+
             if i % 50 == 0:
                 LOG.debug("[debug] total_flow_entries=%d per_agent=%s",
                           sum(len(x) for x in parsed_flows),
@@ -2073,16 +2175,33 @@ def marlExperiment(
                                 dat = learner_traces[l_index][ip_pair]
                                 (st, z, narrowing_in_use) = dat[0][s_ac_num]
                                 machine = dat[2]
+                                # allow_update_narrowing = False
+                                # allow_action_narrowing = False
+                                # if narrowing_in_use is None and (np.random.uniform() < s.get_epsilon() * explore_feature_isolation_modifier):
+                                #     mod = 1 if always_include_global else 0
+                                #     narrowing_in_use = [explore_feature_isolation_duration, ([0] if always_include_global else []) + [np.random.choice(s.tiling_set_count-mod)+mod]]
+                                #     allow_action_narrowing = True
+                                # elif narrowing_in_use is not None:
+                                #     narrowing_in_use[0] -= 1
+                                #     allow_update_narrowing = True
+                                #     allow_action_narrowing = narrowing_in_use[0] > 0
+
                                 allow_update_narrowing = False
                                 allow_action_narrowing = False
+
                                 if narrowing_in_use is None and (np.random.uniform() < s.get_epsilon() * explore_feature_isolation_modifier):
-                                    mod = 1 if always_include_global else 0
-                                    narrowing_in_use = [explore_feature_isolation_duration, ([0] if always_include_global else []) + [np.random.choice(s.tiling_set_count-mod)+mod]]
-                                    allow_action_narrowing = True
+                                    cand = _pick_narrowing_indices(s, always_include_global)
+                                    if cand is not None and len(cand) > 0:
+                                        narrowing_in_use = [explore_feature_isolation_duration, cand]
+                                        allow_action_narrowing = True
+                                    else:
+                                        # No valid tiles to narrow on; leave narrowing disabled for this step
+                                        narrowing_in_use = None
                                 elif narrowing_in_use is not None:
                                     narrowing_in_use[0] -= 1
                                     allow_update_narrowing = True
                                     allow_action_narrowing = narrowing_in_use[0] > 0
+
                                 dest_label = resolve_dest_label(ip_pair[1])
                                 (would_choose, new_vals, z_vec) = s.update(
                                     state,
@@ -2187,6 +2306,12 @@ def marlExperiment(
             print("[INFO] Final post-run Mininet CLI (after last episode). 'exit' to clean up.")
             CLI(net)
         mon_cmd.stdin.close()
+
+        # Close monitor reporter
+        try:
+            mon_reporter.close()
+        except Exception:
+            pass
 
         if bw_sock is not None:
             try:

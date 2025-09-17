@@ -115,6 +115,7 @@ class SarsaLearner:
         self._ensure_state_vals_exist(state)
         return [self.values[tile] for tile in state]
 
+    # NOTE: FIXED 2025-09-17 : clamps invalid indices
     def _update_state_values(
         self,
         state: Sequence[int],
@@ -123,13 +124,38 @@ class SarsaLearner:
         narrowing: Optional[Iterable[int]],
     ) -> None:
         self._ensure_state_vals_exist(state)
-        if narrowing is None:
-            narrowing = range(len(state))
+        n_tiles = len(state)
 
-        for i in narrowing:
+        if narrowing is None:
+            indices = range(n_tiles)
+        else:
+            # Keep only indices valid for both `state` and the `values` vector we were given
+            try:
+                indices = [int(i) for i in narrowing if 0 <= int(i) < n_tiles and int(i) < len(values)]
+            except Exception:
+                indices = range(n_tiles)
+            if not indices:
+                indices = range(n_tiles)
+
+        for i in indices:
             tile = state[i]
-            value = values[i]
-            self.values[tile][action] = value
+            self.values[tile][action] = float(values[i])
+
+    # def _update_state_values(
+    #     self,
+    #     state: Sequence[int],
+    #     action: int,
+    #     values: np.ndarray,
+    #     narrowing: Optional[Iterable[int]],
+    # ) -> None:
+    #     self._ensure_state_vals_exist(state)
+    #     if narrowing is None:
+    #         narrowing = range(len(state))
+
+    #     for i in narrowing:
+    #         tile = state[i]
+    #         value = values[i]
+    #         self.values[tile][action] = value
 
     def _compute_relevant_narrowed_tilings(self, narrowing: Sequence[int]) -> np.ndarray:
         """
@@ -154,27 +180,60 @@ class SarsaLearner:
 
     # ---------- Policy ----------
 
+    # NOTE: FIXED 2025-09-17 : clamps invalid indices
     def select_action(self, state: Sequence[int], narrowing: Optional[Iterable[int]] = None):
         """
         Returns:
-          (a_index, per_tiling_vals_for_chosen_action, per_tiling_vals_for_argmax_action, action_vals_sum)
+        (a_index, per_tiling_vals_for_chosen_action, per_tiling_vals_for_argmax_action, action_vals_sum)
         """
         all_tile_action_vals = self._get_state_values(state)
+        n_tiles = len(all_tile_action_vals)
 
+        # Narrowing is a list of *positions* in this state's active-tiles list.
         if narrowing is None:
-            narrowing = range(len(all_tile_action_vals))
+            use_idx = range(n_tiles)
+        else:
+            try:
+                use_idx = [int(i) for i in narrowing if 0 <= int(i) < n_tiles]
+            except Exception:
+                use_idx = list(range(n_tiles))
+            if not use_idx:
+                # Nothing valid—fall back to using all tiles
+                use_idx = range(n_tiles)
 
         action_vals = np.zeros(len(self.actions), dtype=float)
-        for tile_index in narrowing:
+        for tile_index in use_idx:
             action_vals += all_tile_action_vals[tile_index]
 
         a_index = self.select_action_from_vals(action_vals)
-        return (
-            a_index,
-            np.array([av[a_index] for av in all_tile_action_vals], dtype=float),
-            np.array([av[np.argmax(action_vals)] for av in all_tile_action_vals], dtype=float),
-            action_vals,
-        )
+
+        chosen_vals = np.array([av[a_index] for av in all_tile_action_vals], dtype=float)
+        argmax_idx = int(np.argmax(action_vals))
+        argmax_vals = np.array([av[argmax_idx] for av in all_tile_action_vals], dtype=float)
+
+        return (a_index, chosen_vals, argmax_vals, action_vals)
+
+    # def select_action(self, state: Sequence[int], narrowing: Optional[Iterable[int]] = None):
+    #     """
+    #     Returns:
+    #       (a_index, per_tiling_vals_for_chosen_action, per_tiling_vals_for_argmax_action, action_vals_sum)
+    #     """
+    #     all_tile_action_vals = self._get_state_values(state)
+
+    #     if narrowing is None:
+    #         narrowing = range(len(all_tile_action_vals))
+
+    #     action_vals = np.zeros(len(self.actions), dtype=float)
+    #     for tile_index in narrowing:
+    #         action_vals += all_tile_action_vals[tile_index]
+
+    #     a_index = self.select_action_from_vals(action_vals)
+    #     return (
+    #         a_index,
+    #         np.array([av[a_index] for av in all_tile_action_vals], dtype=float),
+    #         np.array([av[np.argmax(action_vals)] for av in all_tile_action_vals], dtype=float),
+    #         action_vals,
+    #     )
 
     def select_action_from_vals(self, vals: np.ndarray) -> int:
         # Epsilon-greedy (linear-decreasing epsilon handled in decay())
