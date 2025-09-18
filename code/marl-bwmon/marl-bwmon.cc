@@ -29,6 +29,8 @@
 
 namespace ch = std::chrono;
 
+// #define DEBUG
+
 ch::high_resolution_clock::time_point stdifyTimeval(const struct timeval tv)
 {
 	return ch::high_resolution_clock::time_point(
@@ -39,7 +41,7 @@ const int LISTEN_PORT = 9932;
 const bool TIME_PRINT_ERR = false;
 const bool USE_UNIX_SOCK = true;
 const char *SOCKET_PATH = "/tmp/bwmon-sock";
-const int FLOW_PRUNE_AGE = 2;
+const int FLOW_PRUNE_AGE = 10; // Changed from 2, in 2025-09-17
 
 // Store and update some stats about float64s.
 struct Stat
@@ -208,46 +210,49 @@ struct InnerFlowStats
 		return true;
 	}
 
-	std::optional<std::pair<bool, FlowMeasurement>> clearAndRetrieveStats(uint32_t ip, char *ip_str, ch::high_resolution_clock::time_point startTime, ch::high_resolution_clock::time_point endTime)
+	// FIXED: 2025-09-17
+	std::optional<std::pair<bool, FlowMeasurement>> clearAndRetrieveStats(uint32_t ip, char * /*ip_str*/,
+																		  ch::high_resolution_clock::time_point startTime,
+																		  ch::high_resolution_clock::time_point endTime)
 	{
-		auto prune_age = ch::seconds(FLOW_PRUNE_AGE);
+		// Pruning policy (optional): if you want pruning, re-enable the checks below.
+		// auto prune_age = ch::seconds(FLOW_PRUNE_AGE);
+		// auto silent_duration = endTime - last_entry;
+		// if (silent_duration > prune_age && last_entry < startTime) {
+		//     return std::nullopt;
+		// }
 
-		// prune here if last packet rx'd was of a certain age,
-		// AND there was no info gleaned in this window.
-		// Don't print stats in that case.
+		auto duration = endTime - startTime;
 
-		auto duration = endTime - flow_start;
-		auto silent_duration = endTime - last_entry;
-
-		if (silent_duration > prune_age && last_entry < startTime)
-		{
-			return std::nullopt;
-		}
-
-		auto fm = FlowMeasurement{
-			ch::nanoseconds(duration).count(),
-			flow_size_in,
-			flow_size_out,
-			flow_size_in - flow_size_in_prev,
-			flow_size_out - flow_size_out_prev,
-			in_packets_window.k,
-			out_packets_window.k,
-			(float)in_packets_window.mean,
-			(float)in_packets_window.variance(),
-			(float)out_packets_window.mean,
-			(float)out_packets_window.variance(),
-			(float)interarrivals_window.mean,
-			(float)interarrivals_window.variance(),
-			ip,
+		FlowMeasurement fm{
+			ch::nanoseconds(endTime - flow_start).count(),		 // flow_length
+			flow_size_in,										 // size_in
+			flow_size_out,										 // size_out
+			flow_size_in - flow_size_in_prev,					 // delta_in
+			flow_size_out - flow_size_out_prev,					 // delta_out
+			in_packets_window.k,								 // packets_in_count
+			out_packets_window.k,								 // packets_out_count
+			static_cast<float>(in_packets_window.mean),			 // packets_in_mean
+			static_cast<float>(in_packets_window.variance()),	 // packets_in_variance
+			static_cast<float>(out_packets_window.mean),		 // packets_out_mean
+			static_cast<float>(out_packets_window.variance()),	 // packets_out_variance
+			static_cast<float>(interarrivals_window.mean),		 // iat_mean
+			static_cast<float>(interarrivals_window.variance()), // iat_variance
+			ip													 // ip (network-order u32)
 		};
 
+		// Prepare for next window
 		flow_size_in_prev = flow_size_in;
 		flow_size_out_prev = flow_size_out;
+		in_packets_window.clear();
+		out_packets_window.clear();
+		interarrivals_window.clear();
 
-		auto new_data = unseen;
+		bool new_data = unseen;
 		unseen = false;
+		(void)duration; // if you later want to use it
 
-		return std::optional<std::pair<bool, FlowMeasurement>>{std::make_pair(new_data, fm)};
+		return std::make_optional(std::make_pair(new_data, fm));
 	}
 
 	void clear()
@@ -330,199 +335,113 @@ struct FlowStats
 		return true;
 	}
 
-	// FIXED - 2025-09-15
-	std::optional<std::pair<bool, FlowMeasurement>>
-	clearAndRetrieveStats(uint32_t ip, char *ip_str,
-									ch::high_resolution_clock::time_point startTime,
-									ch::high_resolution_clock::time_point endTime)
+	// FIXED - 2025-09-17
+	std::optional<std::pair<bool, FlowMeasurement>> clearAndRetrieveStats(uint32_t ip, char * /*ip_str*/,
+																		  ch::high_resolution_clock::time_point startTime,
+																		  ch::high_resolution_clock::time_point endTime)
 	{
-		using namespace std;
+		// Aggregate all per-destination (InnerFlowStats) windows for this external IP.
+		const auto dur_ns =
+			std::chrono::duration_cast<std::chrono::nanoseconds>(endTime - startTime).count();
 
-		if (per_dest_stats_.empty()) {
-			return std::nullopt;
-		}
+		// Byte totals & deltas
+		uint64_t size_in = 0, size_out = 0;
+		uint64_t delta_in = 0, delta_out = 0;
 
-		// Helper: pooled mean/variance combiner (parallel/Welford)
-		struct Combiner {
-			double mean = 0.0;
-			double M2   = 0.0;   // sum of squared deviations
-			uint64_t n  = 0;
+		// Packet counts (sum)
+		uint64_t pkts_in = 0, pkts_out = 0;
 
-			void add(uint64_t k, double m, double var_sample) {
-				if (k == 0) return;
-				// var_sample is sample variance (S^2); convert to M2_i = var * (k-1)
-				double M2_i = (k >= 2) ? var_sample * (double)(k - 1) : 0.0;
-
-				if (n == 0) {
-					n = k; mean = m; M2 = M2_i;
-					return;
-				}
-				double delta = m - mean;
-				uint64_t new_n = n + k;
-				mean += delta * ((double)k / (double)new_n);
-				M2 += M2_i + delta * delta * ((double)n * (double)k / (double)new_n);
-				n = new_n;
+		// Pooled means/variances via Welford (sample variance)
+		auto combine = [](uint64_t k, double m, double var,
+						  uint64_t &K, double &Mean, double &M2)
+		{
+			if (k == 0)
+				return;
+			const double M2_i = (k >= 2) ? var * double(k - 1) : 0.0; // sample var → M2
+			if (K == 0)
+			{
+				K = k;
+				Mean = m;
+				M2 = M2_i;
+				return;
 			}
-
-			double out_mean() const { return (n ? mean : 0.0); }
-			double out_var()  const { return (n >= 2 ? M2 / (double)(n - 1) : 0.0); }
+			const double delta = m - Mean;
+			const uint64_t newK = K + k;
+			Mean += delta * (double)k / (double)newK;
+			M2 += M2_i + delta * delta * ((double)K * (double)k / (double)newK);
+			K = newK;
 		};
 
-		const auto prune_age = ch::seconds(FLOW_PRUNE_AGE);
+		uint64_t ps_in_K = 0, ps_out_K = 0, iat_K = 0;
+		double ps_in_Mean = 0.0, ps_out_Mean = 0.0, iat_Mean = 0.0;
+		double ps_in_M2 = 0.0, ps_out_M2 = 0.0, iat_M2 = 0.0;
 
-		// Aggregates across all InnerFlowStats
-		uint64_t size_in_total  = 0;
-		uint64_t size_out_total = 0;
-		uint64_t delta_in_total  = 0;
-		uint64_t delta_out_total = 0;
+		bool any_new = false;
+		std::vector<uint32_t> to_prune;
 
-		uint64_t pkts_in_total  = 0;
-		uint64_t pkts_out_total = 0;
-
-		Combiner in_pkt_comb;
-		Combiner out_pkt_comb;
-		Combiner iat_comb;
-
-		// For a representative aggregate "flow length", use the max across inners
-		int64_t duration_ns_max = 0;
-
-		bool any_new_data = false;
-		vector<uint32_t> to_prune;
-
-		for (auto &entry : per_dest_stats_) {
-			auto internal_ip  = entry.first;
-			auto &inner       = entry.second;
-
-			// Decide whether this inner contributes in this window (same logic as inner’s clearAndRetrieveStats)
-			auto duration       = endTime - inner.flow_start;
-			auto silent_duration= endTime - inner.last_entry;
-
-			bool inactive = (silent_duration > prune_age && inner.last_entry < startTime);
-			if (inactive) {
-				// prune this inner
-				to_prune.push_back(internal_ip);
+		for (auto &kv : per_dest_stats_)
+		{
+			auto &inner = kv.second;
+			auto m = inner.clearAndRetrieveStats(ip, nullptr, startTime, endTime);
+			if (!m)
+			{
+				to_prune.push_back(kv.first);
 				continue;
 			}
 
-			// Contribute this inner’s window to the aggregate
-			int64_t dur_ns = ch::nanoseconds(duration).count();
-			if (dur_ns > duration_ns_max) duration_ns_max = dur_ns;
+			any_new |= m->first;
+			const FlowMeasurement &fm = m->second;
 
-			// Sizes + deltas
-			size_in_total  += inner.flow_size_in;
-			size_out_total += inner.flow_size_out;
+			// bytes / deltas / counts
+			size_in += fm.size_in;
+			size_out += fm.size_out;
+			delta_in += fm.delta_in;
+			delta_out += fm.delta_out;
 
-			uint64_t d_in  = inner.flow_size_in  - inner.flow_size_in_prev;
-			uint64_t d_out = inner.flow_size_out - inner.flow_size_out_prev;
-			delta_in_total  += d_in;
-			delta_out_total += d_out;
+			pkts_in += fm.packets_in_count;
+			pkts_out += fm.packets_out_count;
 
-			// Packet stats (counts are the k's in the per-window stats)
-			uint64_t in_k  = inner.in_packets_window.k;
-			uint64_t out_k = inner.out_packets_window.k;
+			// packet-size stats (in/out)
+			combine(fm.packets_in_count, fm.packets_in_mean, fm.packets_in_variance,
+					ps_in_K, ps_in_Mean, ps_in_M2);
+			combine(fm.packets_out_count, fm.packets_out_mean, fm.packets_out_variance,
+					ps_out_K, ps_out_Mean, ps_out_M2);
 
-			pkts_in_total  += in_k;
-			pkts_out_total += out_k;
-
-			// Combine means/variances across inners
-			in_pkt_comb.add(in_k,  inner.in_packets_window.mean,  inner.in_packets_window.variance());
-			out_pkt_comb.add(out_k, inner.out_packets_window.mean, inner.out_packets_window.variance());
-			iat_comb.add(inner.interarrivals_window.k,
-						inner.interarrivals_window.mean,
-						inner.interarrivals_window.variance());
-
-			// Track "newness": if any inner was previously unseen, mark aggregate as new
-			if (inner.unseen) {
-				any_new_data = true;
-			}
-
-			// Advance inner’s prev counters & clear windows (same as inner.clearAndRetrieveStats())
-			inner.flow_size_in_prev  = inner.flow_size_in;
-			inner.flow_size_out_prev = inner.flow_size_out;
-			inner.unseen = false;
-			inner.clear();
+			// IAT stats: you track IATs only for inbound packets; use inbound count as k
+			combine(fm.packets_in_count, fm.iat_mean, fm.iat_variance,
+					iat_K, iat_Mean, iat_M2);
 		}
 
-		// Actually prune inners that went inactive
-		for (auto id : to_prune) {
-			per_dest_stats_.erase(id);
-		}
+		// prune inactive inners after iterating
+		for (auto ip_inner : to_prune)
+			per_dest_stats_.erase(ip_inner);
 
-		// If *all* inners were inactive (or there were none), nothing to report for this external ip
-		if (pkts_in_total == 0 && pkts_out_total == 0 &&
-			delta_in_total == 0 && delta_out_total == 0 &&
-			duration_ns_max == 0 && per_dest_stats_.empty())
+		// nothing left? return empty
+		if (size_in == 0 && size_out == 0 && delta_in == 0 && delta_out == 0 &&
+			pkts_in == 0 && pkts_out == 0 && ps_in_K == 0 && ps_out_K == 0 && iat_K == 0)
 		{
 			return std::nullopt;
 		}
 
-		FlowMeasurement fm {
-			duration_ns_max,
-			size_in_total,
-			size_out_total,
-			delta_in_total,
-			delta_out_total,
-			pkts_in_total,
-			pkts_out_total,
-			(float)in_pkt_comb.out_mean(),
-			(float)in_pkt_comb.out_var(),
-			(float)out_pkt_comb.out_mean(),
-			(float)out_pkt_comb.out_var(),
-			(float)iat_comb.out_mean(),
-			(float)iat_comb.out_var(),
-			ip  // external IP for this FlowStats
-		};
+		// Build one aggregate measurement for this external IP
+		FlowMeasurement agg{};
+		agg.flow_length = (int64_t)dur_ns;
+		agg.size_in = size_in;
+		agg.size_out = size_out;
+		agg.delta_in = delta_in;
+		agg.delta_out = delta_out;
+		agg.packets_in_count = pkts_in;
+		agg.packets_out_count = pkts_out;
+		agg.packets_in_mean = (float)ps_in_Mean;
+		agg.packets_in_variance = (float)((ps_in_K >= 2) ? (ps_in_M2 / (double)(ps_in_K - 1)) : 0.0);
+		agg.packets_out_mean = (float)ps_out_Mean;
+		agg.packets_out_variance = (float)((ps_out_K >= 2) ? (ps_out_M2 / (double)(ps_out_K - 1)) : 0.0);
+		agg.iat_mean = (float)iat_Mean;
+		agg.iat_variance = (float)((iat_K >= 2) ? (iat_M2 / (double)(iat_K - 1)) : 0.0);
+		agg.ip = ip;
 
-		return std::optional<std::pair<bool, FlowMeasurement>>{
-			std::make_pair(any_new_data, fm)
-		};
+		return std::make_optional(std::make_pair(any_new, agg));
 	}
-
-	// std::optional<std::pair<bool, FlowMeasurement>> clearAndRetrieveStats(uint32_t ip, char *ip_str, ch::high_resolution_clock::time_point startTime, ch::high_resolution_clock::time_point endTime)
-	// {
-	// 	// auto prune_age = ch::seconds(FLOW_PRUNE_AGE);
-
-	// 	// // prune here if last packet rx'd was of a certain age,
-	// 	// // AND there was no info gleaned in this window.
-	// 	// // Don't print stats in that case.
-
-	// 	// auto duration = endTime - flow_start;
-	// 	// auto silent_duration = endTime - last_entry;
-
-	// 	// if (silent_duration > prune_age && last_entry < startTime) {
-	// 	// 	return std::nullopt;
-	// 	// }
-
-	// 	// auto fm = FlowMeasurement {
-	// 	// 	ch::nanoseconds(duration).count(),
-	// 	// 	flow_size_in,
-	// 	// 	flow_size_out,
-	// 	// 	flow_size_in - flow_size_in_prev,
-	// 	// 	flow_size_out - flow_size_out_prev,
-	// 	// 	in_packets_window.k,
-	// 	// 	out_packets_window.k,
-	// 	// 	(float) in_packets_window.mean,
-	// 	// 	(float) in_packets_window.variance(),
-	// 	// 	(float) out_packets_window.mean,
-	// 	// 	(float) out_packets_window.variance(),
-	// 	// 	(float) interarrivals_window.mean,
-	// 	// 	(float) interarrivals_window.variance(),
-	// 	// 	ip,
-	// 	// };
-
-	// 	// clear();
-
-	// 	// flow_size_in_prev = flow_size_in;
-	// 	// flow_size_out_prev = flow_size_out;
-
-	// 	// auto new_data = unseen;
-	// 	// unseen = false;
-
-	// 	// return std::optional<std::pair<bool, FlowMeasurement>> {std::make_pair(new_data, fm)};
-
-	// 	// FIXME
-	// 	return std::nullopt;
-	// }
 };
 
 struct ValueSet
@@ -606,166 +525,119 @@ public:
 
 	// FIXED: 2025-09-15: for potential read deadlock
 	ValueSet clearAndRetrieveStats(ch::high_resolution_clock::time_point startTime,
-								std::vector<uint32_t>& allowed_ips)
+								   std::vector<uint32_t> &allowed_ips)
 	{
 		// 1) Arm the limiter under the exclusive lock.
 		{
 			std::unique_lock<std::shared_mutex> lock(mutex_);
 			limiting_ = true;
-			limit_    = ch::high_resolution_clock::now();
+			limit_ = ch::high_resolution_clock::now();
 			to_go_.store(num_interfaces_);
 		}
 
 		// 2) Wait for all capture threads to observe 'limit_' WITHOUT holding the lock.
-		while (to_go_.load(std::memory_order_acquire) > 0) {
+		while (to_go_.load(std::memory_order_acquire) > 0)
+		{
 			std::this_thread::sleep_for(std::chrono::microseconds(50));
 		}
 
 		// 3) Reacquire the lock and build the snapshot.
 		std::unique_lock<std::shared_mutex> lock(mutex_);
-		const auto endTime     = limit_;
+		const auto endTime = limit_;
 		const int64_t duration_ns = std::chrono::nanoseconds(endTime - startTime).count();
 
 		auto goods = good_byte_counts_;
-		auto bads  = bad_byte_counts_;
+		auto bads = bad_byte_counts_;
 
 		std::vector<std::vector<FlowMeasurement>> flows;
 		flows.reserve(flow_stats_.size());
 
-		for (size_t i = 0; i < flow_stats_.size(); ++i) {
-			if (!isImportant(static_cast<int>(i))) continue;
+#ifdef DEBUG
+		for (auto aip : allowed_ips)
+		{
+			std::cout << "Allowed IP : " << aip << std::endl;
+		}
+#endif
 
-			auto& outer_map = flow_stats_[i]; // external_ip -> FlowStats
+		for (size_t i = 0; i < flow_stats_.size(); ++i)
+		{
+			if (!isImportant(static_cast<int>(i)))
+			{
+#ifdef DEBUG
+				std::cout << "The flow " << i << " is not important" << std::endl;
+#endif
+				continue;
+			}
+
+			auto &outer_map = flow_stats_[i]; // external_ip -> FlowStats
 			std::vector<FlowMeasurement> local_flows;
 			std::vector<uint32_t> prune_externals;
 
-			for (auto& ext_pair : outer_map) {
-				auto& fs = ext_pair.second; // FlowStats
+			for (auto &ext_pair : outer_map)
+			{
+				auto &fs = ext_pair.second; // FlowStats
+#ifdef DEBUG
+				std::cout << "This flow key is " << ext_pair.first << std::endl;
+#endif
 				std::vector<uint32_t> prune_internals;
 
-				for (auto& in_pair : fs.per_dest_stats_) {
+				for (auto &in_pair : fs.per_dest_stats_)
+				{
 					const uint32_t internal_ip = in_pair.first;
-					auto& ifs = in_pair.second; // InnerFlowStats
+					auto &ifs = in_pair.second; // InnerFlowStats
 
 					char ip_str[INET_ADDRSTRLEN];
-					inet_ntop(AF_INET, reinterpret_cast<const in_addr*>(&internal_ip),
-							ip_str, INET_ADDRSTRLEN);
+					inet_ntop(AF_INET, reinterpret_cast<const in_addr *>(&internal_ip),
+							  ip_str, INET_ADDRSTRLEN);
 
 					auto maybe = ifs.clearAndRetrieveStats(internal_ip, ip_str, startTime, endTime);
-					if (!maybe) { prune_internals.push_back(internal_ip); continue; }
+					if (!maybe)
+					{
+						prune_internals.push_back(internal_ip);
+						continue;
+					}
 
 					auto [is_new, fm] = *maybe;
 
-					const bool wanted =
-						is_new ||
-						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
-					if (wanted) local_flows.emplace_back(fm);
+					// const bool wanted =
+					// 	is_new ||
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
+					const uint32_t external_ip = ext_pair.first;  // outer_map key
+					const uint32_t external_ip_net = external_ip; // already network order if that is how stored
+					const uint32_t external_ip_host = ntohl(external_ip);
+
+					const bool match_external =
+						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
+						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
+
+					const bool wanted = is_new || match_external;
+
+#ifdef DEBUG
+					std::cout << "Finding internal ip " << internal_ip << std::endl;
+#endif
+					if (wanted)
+						local_flows.emplace_back(fm);
 				}
-				for (auto ip : prune_internals) fs.per_dest_stats_.erase(ip);
-				if (fs.per_dest_stats_.empty()) prune_externals.push_back(ext_pair.first);
+				for (auto ip : prune_internals)
+					fs.per_dest_stats_.erase(ip);
+				if (fs.per_dest_stats_.empty())
+					prune_externals.push_back(ext_pair.first);
 			}
-			for (auto ip : prune_externals) outer_map.erase(ip);
+			for (auto ip : prune_externals)
+				outer_map.erase(ip);
 			flows.emplace_back(std::move(local_flows));
 		}
 
 		// Reset counters for next window
 		std::fill(good_byte_counts_.begin(), good_byte_counts_.end(), 0);
-		std::fill(bad_byte_counts_.begin(),  bad_byte_counts_.end(),  0);
+		std::fill(bad_byte_counts_.begin(), bad_byte_counts_.end(), 0);
 
 		limiting_ = false;
 		stopped_limiting_.notify_all();
 
-		return ValueSet{ endTime, duration_ns, goods, bads, flows };
+		return ValueSet{endTime, duration_ns, goods, bads, flows};
 	}
 
-/*
-	ValueSet clearAndRetrieveStats(ch::high_resolution_clock::time_point startTime, std::vector<uint32_t> &allowed_ips)
-	{
-		std::unique_lock<std::shared_mutex> lock(mutex_);
-
-		auto endTime = ch::high_resolution_clock::now();
-		auto duration = endTime - startTime;
-
-		// First, tell the threads they have a limit TO WORK UP TO.
-		limiting_ = true;
-		limit_ = endTime;
-		to_go_.store(num_interfaces_);
-
-		// Okay, now await the signal from all the workers...
-		int t_g = num_interfaces_;
-		while ((t_g = to_go_.load()) > 0)
-		{
-			hit_limit_.wait(lock);
-		}
-
-		// Then, we need to wait for them to finish before we do all this...
-		auto duration_ns = ch::nanoseconds(duration).count();
-		auto goods = good_byte_counts_;
-		auto bads = bad_byte_counts_;
-		auto flows = std::vector<std::vector<FlowMeasurement>>();
-
-		// capture all relevant flow info...
-		// use allowed_ips
-		for (unsigned int i = 0; i < flow_stats_.size(); ++i)
-		{
-			if (!isImportant(i))
-			{
-				continue;
-			}
-
-			auto &ip_map = flow_stats_.at(i);
-			auto to_prune = std::vector<uint32_t>();
-			auto local_flows = std::vector<FlowMeasurement>();
-
-			for (auto &el : ip_map)
-			{
-				char ip_str[INET_ADDRSTRLEN];
-				auto c_ip = reinterpret_cast<const in_addr *>(&el.first);
-				inet_ntop(AF_INET, c_ip, ip_str, INET_ADDRSTRLEN);
-
-				auto maybe_flow_stat = el.second.clearAndRetrieveStats(el.first, ip_str, startTime, endTime);
-				if (maybe_flow_stat == std::nullopt)
-				{
-					to_prune.emplace_back(el.first);
-				}
-				else
-				{
-					auto d = maybe_flow_stat.value();
-					// Need to bypass this if flow is new.
-					if (d.first || std::find(allowed_ips.begin(), allowed_ips.end(), el.first) != allowed_ips.end())
-					{
-						local_flows.emplace_back(d.second);
-					}
-				}
-			}
-			flows.emplace_back(local_flows);
-
-			for (auto &ip : to_prune)
-			{
-				ip_map.erase(ip);
-			}
-		}
-
-		// Empty the stats.
-		for (auto &el : good_byte_counts_)
-			el = 0;
-		for (auto &el : bad_byte_counts_)
-			el = 0;
-
-		limiting_ = false;
-
-		// Signal done.
-		stopped_limiting_.notify_all();
-
-		return ValueSet{
-			endTime,
-			duration_ns,
-			goods,
-			bads,
-			flows,
-		};
-	}
-*/
 	ch::high_resolution_clock::time_point clearAndPrintStats(ch::high_resolution_clock::time_point startTime)
 	{
 		std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -886,31 +758,102 @@ public:
 	}
 };
 
-static uint32_t make_netmask(int len)
+static inline uint32_t mask_from_prefix_host(int pfx)
+/* Return a /pfx mask in **host** byte order (e.g., /24 -> 0xFFFFFF00 on LE) */
 {
-	return htonl(0xffffffff << (32 - len));
+	if (pfx <= 0)
+		return 0u;
+	if (pfx >= 32)
+		return 0xFFFFFFFFu;
+	// build in host order; shift is defined since 0 < pfx < 32
+	return 0xFFFFFFFFu << (32 - pfx);
 }
 
 struct PcapLoopParams
 {
-	PcapLoopParams(InterfaceStats &s, pcap_t *p, int i, int link)
+	PcapLoopParams(InterfaceStats &s, pcap_t *p, int i, int link,
+				   const char *cidr_subnet = "10.0.0.0", int prefix = 24)
 		: stats(s), iface(p), index(i), linkType(link)
 	{
-		this->netmask = make_netmask(24);
-		inet_pton(AF_INET, "10.0.0.0", reinterpret_cast<in_addr *>(&this->subnet));
+		// Store subnet and mask in HOST order.
+		in_addr in{};
+		if (inet_pton(AF_INET, cidr_subnet, &in) != 1)
+		{
+			// fallback to 0.0.0.0/0 if the string is bad
+			subnet = 0u;
+			netmask = 0u;
+		}
+		else
+		{
+			subnet = ntohl(in.s_addr);
+			netmask = mask_from_prefix_host(prefix);
+			// normalize subnet to network address
+			subnet &= netmask;
+		}
 	}
+
 	InterfaceStats &stats;
 	pcap_t *iface;
 	const int index;
 	const int linkType;
-	uint32_t subnet;
-	uint32_t netmask;
 
-	bool is_ip_local(const uint32_t addr)
+	// Host-order network/subnet
+	uint32_t subnet;  // e.g., 10.0.0.0 as 0x0A000000 **host order**
+	uint32_t netmask; // e.g., /24 as 0xFFFFFF00 **host order**
+
+	// Expects addr in **host** order
+	bool is_ip_local(uint32_t addr) const
 	{
 		return (addr & netmask) == subnet;
 	}
 };
+
+static bool parse_ipv4_addrs_EN10MB(const u_char *data, uint32_t caplen,
+									uint32_t &src_host, uint32_t &dst_host,
+									size_t &l3_off)
+{
+	// Ethernet header
+	if (caplen < 14)
+		return false;
+	size_t off = 14;
+
+	// Read EtherType (bytes 12..13)
+	uint16_t ethertype;
+	std::memcpy(&ethertype, data + 12, sizeof(ethertype));
+	ethertype = ntohs(ethertype);
+
+	// Skip VLAN/QinQ tags
+	while (ethertype == 0x8100 /*802.1Q*/ || ethertype == 0x88a8 /*QinQ*/)
+	{
+		if (caplen < off + 4)
+			return false; // not enough for VLAN tag
+		// inner EtherType is at tag+2
+		std::memcpy(&ethertype, data + off + 2, sizeof(ethertype));
+		ethertype = ntohs(ethertype);
+		off += 4;
+	}
+
+	if (ethertype != 0x0800)
+		return false; // not IPv4
+
+	// Need at least the minimal IPv4 header
+	if (caplen < off + 20)
+		return false;
+
+	// Optionally verify IHL >= 5
+	uint8_t ihl = data[off] & 0x0F;
+	if (ihl < 5)
+		return false;
+
+	// Read src/dst (network order -> host order)
+	uint32_t src_be, dst_be;
+	std::memcpy(&src_be, data + off + 12, sizeof(src_be));
+	std::memcpy(&dst_be, data + off + 16, sizeof(dst_be));
+	src_host = ntohl(src_be);
+	dst_host = ntohl(dst_be);
+	l3_off = off;
+	return true;
+}
 
 static void perPacketHandle(u_char *user, const struct pcap_pkthdr *h, const u_char *data)
 {
@@ -922,47 +865,61 @@ static void perPacketHandle(u_char *user, const struct pcap_pkthdr *h, const u_c
 	// Look at the packet, decide good/bad, then increment!
 	// Establish the facts: HERE.
 	// Okay, we can read up to h->caplen bytes from data.
-	bool good = false;
-	bool outbound = true;
-	uint32_t external_ip = 0;
-	uint32_t internal_ip = 0;
+	uint32_t src_ip_h = 0, dst_ip_h = 0;
+	size_t l3off = 0;
 
 	switch (params->linkType)
 	{
 	case DLT_NULL:
-		std::cout << "null linktype (?)" << std::endl;
+	{
+		// BSD loopback: 4-byte AF_*
+		if (h->caplen < 4 + 20)
+			return;
+		size_t off = 4;
+		uint32_t s, d;
+		std::memcpy(&s, data + off + 12, 4);
+		std::memcpy(&d, data + off + 16, 4);
+		src_ip_h = ntohl(s);
+		dst_ip_h = ntohl(d);
 		break;
+	}
 	case DLT_EN10MB:
 	{
-		// jump in 14 bytes, hope for IPv4. Only do v4 because LAZY.
-		// Source addr is 12 further octets in.
-		// Dest addr is 16 into IP (adj to src ip.)
-		auto src_ip = *reinterpret_cast<const uint32_t *>(data + 26);
-		auto dst_ip = *reinterpret_cast<const uint32_t *>(data + 30);
-
-		// If src is local, then assess based on dst.
-		outbound = params->is_ip_local(src_ip);
-		external_ip = outbound
-						  ? dst_ip
-						  : src_ip;
-		internal_ip = outbound
-						  ? src_ip
-						  : dst_ip;
-
-		// Another assumption, we're little endian.
-		// this is only troublesome
-		good = !(((external_ip >> 24) & 0xff) % 2);
+		if (!parse_ipv4_addrs_EN10MB(data, h->caplen, src_ip_h, dst_ip_h, l3off))
+			return;
+		break;
 
 		break;
 	}
 	case DLT_RAW:
-		std::cout << "ip linktype" << std::endl;
+	{
+		if (h->caplen < 20)
+			return;
+		uint32_t s, d;
+		std::memcpy(&s, data + 12, 4);
+		std::memcpy(&d, data + 16, 4);
+		src_ip_h = ntohl(s);
+		dst_ip_h = ntohl(d);
 		break;
+	}
 	default:
 		std::cerr << "Unknown linktype for iface "
 				  << params->index << ": saw " << params->linkType << std::endl;
 	}
+	// Determine outbound/external using host-order addresses
+	bool outbound = params->is_ip_local(src_ip_h);
+	uint32_t internal_ip = outbound ? src_ip_h : dst_ip_h;
+	uint32_t external_ip = outbound ? dst_ip_h : src_ip_h;
 
+	// If you want the first octet reliably:
+	auto first_octet = (external_ip >> 24) & 0xFF; // now correct after ntohl()
+	bool good = !(first_octet % 2);
+
+	// #ifdef DEBUG
+	// 	std::cout << "Tracing a packet with  " << src_ip_h << "->" << dst_ip_h << std::endl
+	// 			  << "This src is local " << outbound << std::endl
+	// 			  << "The good flag is " << good << std::endl;
+	// #endif /*DEBUG*/
 	params->stats.incrementStat(internal_ip, external_ip, params->index, good, h->len, !outbound, arr_time);
 }
 
@@ -1104,307 +1061,176 @@ static bool send_val(int fd, void *location, size_t len, InterfaceStats &stats)
 	return err;
 }
 
-// FIXED: 2025-09-15: safer operations 
+// FIXED: 2025-09-15: safer operations
 static void server_runner(InterfaceStats &stats)
 {
-    using namespace std;
-    auto startTime = ch::high_resolution_clock::now();
-
-    // 1) Create a UNIX domain socket at SOCKET_PATH
-    int server_fd = socket(PF_LOCAL, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket(AF_UNIX)"); exit(EXIT_FAILURE);
-    }
-
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE,
-                   &opt, sizeof(opt)) != 0) {
-        perror("setsockopt"); close(server_fd); exit(EXIT_FAILURE);
-    }
-
-    // Bind absolute path (unlink stale path first), then listen
-    sockaddr_un uaddr{};
-    memset(&uaddr, 0, sizeof(uaddr));
-    uaddr.sun_family = AF_UNIX;
-    // SOCKET_PATH already set to "/tmp/bwmon-sock"
-    // (see the constants block at the top of the file)
-    strncpy(uaddr.sun_path, SOCKET_PATH, sizeof(uaddr.sun_path) - 1);
-    unlink(SOCKET_PATH);
-    if (bind(server_fd, reinterpret_cast<sockaddr*>(&uaddr), sizeof(uaddr)) < 0) {
-        perror("bind(AF_UNIX)"); close(server_fd); exit(EXIT_FAILURE);
-    }
-    // Allow non-root Python to connect if needed
-    chmod(SOCKET_PATH, 0666);
-
-    if (listen(server_fd, 1) < 0) {
-        perror("listen"); close(server_fd); exit(EXIT_FAILURE);
-    }
-
-    // 2) Accept/re-accept loop, one client at a time
-    while (!stats.finished()) {
-        sockaddr_un raddr{};
-        socklen_t   rlen = sizeof(raddr);
-
-        int conn_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&raddr), &rlen);
-        if (conn_fd < 0) {
-            if (errno == EINTR) continue;
-            perror("accept"); break;
-        }
-
-        // 3) Per-connection request/response loop
-        while (!stats.finished()) {
-            // Read a u32: number of flow IP queries (network byte order)
-            uint32_t n_flow_queries = 0;
-            if (read_val(conn_fd, &n_flow_queries, sizeof(n_flow_queries), stats)) {
-                // client disconnected or error
-                break;
-            }
-            n_flow_queries = ntohl(n_flow_queries);
-
-            // Read that many IPs (each u32 in network byte order).
-            std::vector<uint32_t> flow_ips(n_flow_queries);
-            if (n_flow_queries > 0) {
-                const size_t fip_bytes = n_flow_queries * sizeof(uint32_t);
-                if (read_val(conn_fd, flow_ips.data(), fip_bytes, stats)) {
-                    break;
-                }
-                // NOTE: We keep them in network byte order intentionally.
-                // The snapshot code compares raw u32 host addresses as stored
-                // from packets; Python must send them packed as "!I".
-            }
-
-            const auto inTime = ch::high_resolution_clock::now();
-
-            // Build a snapshot ending "now".
-            // This also resets per-window counters for the next tick.
-            ValueSet stat_block = stats.clearAndRetrieveStats(startTime, flow_ips);  // returns time, duration_ns, good_bytes, bad_bytes, flows
-            // Protocol framing expected by Python's ask_stats():
-            //  - int64_t duration_ns
-            //  - good_bytes[2*N] then bad_bytes[2*N]
-            //  - for each important interface: u32 n_flows (network order), then n_flows * sizeof(FlowMeasurement)
-
-            // Header: duration (ns)
-            if (send_val(conn_fd, &stat_block.duration_ns, sizeof(int64_t), stats)) goto connection_done;
-
-            // Per-interface bytes (good then bad)
-            for (uint64_t b : stat_block.good_bytes) {
-                if (send_val(conn_fd, &b, sizeof(uint64_t), stats)) goto connection_done;
-            }
-            for (uint64_t b : stat_block.bad_bytes) {
-                if (send_val(conn_fd, &b, sizeof(uint64_t), stats)) goto connection_done;
-            }
-
-            // Per-interface flow blocks
-            for (const auto& flow_vec : stat_block.flows) {
-                uint32_t n_flows = static_cast<uint32_t>(flow_vec.size());
-                uint32_t n_flows_net = htonl(n_flows);
-                if (send_val(conn_fd, &n_flows_net, sizeof(uint32_t), stats)) goto connection_done;
-
-                if (n_flows > 0) {
-                    // FlowMeasurement layout must match Python's struct ("=q6Q6fI4x")
-                    // Ensure your compiler keeps the expected 88-byte size (the program prints it at startup).
-                    const size_t payload = n_flows * sizeof(FlowMeasurement);
-                    if (send_val(conn_fd, const_cast<FlowMeasurement*>(flow_vec.data()), payload, stats)) {
-                        goto connection_done;
-                    }
-                }
-            }
-
-            // Advance the next window start to the snapshot's time
-            startTime = stat_block.time;
-
-            const auto outTime = ch::high_resolution_clock::now();
-            if (TIME_PRINT_ERR) {
-                std::cerr << "C-time:" << ch::nanoseconds(outTime - inTime).count() / 1000000 << std::endl;
-            }
-        }
-
-    connection_done:
-        shutdown(conn_fd, SHUT_RDWR);
-        close(conn_fd);
-        // Loop back to accept a fresh client (or exit if stats.finished()).
-    }
-
-    // 4) Clean up the listener
-    close(server_fd);
-    // (SOCKET_PATH will be unlinked on next bind; optional runtime unlink here)
-    // unlink(SOCKET_PATH);
-    std::this_thread::yield();
-}
-
-/*static void server_runner(InterfaceStats &stats)
-{
+	using namespace std;
 	auto startTime = ch::high_resolution_clock::now();
 
-	int server_fd;
-	sockaddr_in address, remote;
-	sockaddr_un u_address;
-	auto opt = 1;
-
-	if (!USE_UNIX_SOCK)
+	// 1) Create a UNIX domain socket at SOCKET_PATH
+	int server_fd = socket(PF_LOCAL, SOCK_STREAM, 0);
+	if (server_fd < 0)
 	{
-		if (!(server_fd = socket(PF_INET, SOCK_STREAM, 0)))
-		{
-			perror("couldn't create socket");
-			exit(EXIT_FAILURE);
-		}
-	}
-	else
-	{
-		if (!(server_fd = socket(PF_LOCAL, SOCK_STREAM, 0)))
-		{
-			perror("couldn't create socket");
-			exit(EXIT_FAILURE);
-		}
+		perror("socket(AF_UNIX)");
+		exit(EXIT_FAILURE);
 	}
 
-	if (setsockopt(
-			server_fd,
-			SOL_SOCKET,
-			SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE,
-			&opt,
-			sizeof(opt)))
+	int opt = 1;
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT | SO_KEEPALIVE,
+				   &opt, sizeof(opt)) != 0)
 	{
-		perror("couldn't set socket options");
+		perror("setsockopt");
 		close(server_fd);
 		exit(EXIT_FAILURE);
 	}
 
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons(LISTEN_PORT);
-
-	memset(&u_address, 0, sizeof(u_address));
-	u_address.sun_family = AF_UNIX;
-	strncpy(u_address.sun_path, SOCKET_PATH, sizeof(u_address.sun_path) - 1);
-
-	if (!USE_UNIX_SOCK)
+	// Bind absolute path (unlink stale path first), then listen
+	sockaddr_un uaddr{};
+	memset(&uaddr, 0, sizeof(uaddr));
+	uaddr.sun_family = AF_UNIX;
+	// SOCKET_PATH already set to "/tmp/bwmon-sock"
+	// (see the constants block at the top of the file)
+	strncpy(uaddr.sun_path, SOCKET_PATH, sizeof(uaddr.sun_path) - 1);
+	unlink(SOCKET_PATH);
+	if (bind(server_fd, reinterpret_cast<sockaddr *>(&uaddr), sizeof(uaddr)) < 0)
 	{
-		if (bind(server_fd, (sockaddr *)&address, sizeof(address)) < 0)
-		{
-			perror("failed to bind port...");
-			close(server_fd);
-			exit(EXIT_FAILURE);
-		}
+		perror("bind(AF_UNIX)");
+		close(server_fd);
+		exit(EXIT_FAILURE);
 	}
-	else
-	{
-		unlink(SOCKET_PATH);
-		if (bind(server_fd, (sockaddr *)&u_address, sizeof(u_address)) < 0)
-		{
-			perror("failed to bind port...");
-			close(server_fd);
-			exit(EXIT_FAILURE);
-		}
-	}
+	// Allow non-root Python to connect if needed
+	chmod(SOCKET_PATH, 0666);
+
 	if (listen(server_fd, 1) < 0)
 	{
-		perror("failed to listen on local address");
+		perror("listen");
 		close(server_fd);
 		exit(EXIT_FAILURE);
 	}
 
-	// First, select the fd with a timeout.
-	// Accept if it didn't time out.
-	// Don't accept a new conn if stats.finished()
-	// and break out of a conn if the whole shebang ended.
-	// (Note: only doing 1 connection at the moment.)
-	// (Probably need non-blocking sockets?)
-	unsigned int addr_sz = sizeof(remote);
-	auto new_conn = accept4(server_fd, (sockaddr *)&remote, &addr_sz, SOCK_NONBLOCK);
-	if (new_conn < 0)
-	{
-		perror("failed to listen on local address");
-		close(server_fd);
-		exit(EXIT_FAILURE);
-	}
-
-	// Loop on reads, exit on stats.finished()
+	// 2) Accept/re-accept loop, one client at a time
 	while (!stats.finished())
 	{
-		// read a u32. (network order).
-		uint32_t n_flow_queries;
+		sockaddr_un raddr{};
+		socklen_t rlen = sizeof(raddr);
 
-		if (read_val(new_conn, &n_flow_queries, sizeof(n_flow_queries), stats))
+		int conn_fd = accept(server_fd, reinterpret_cast<sockaddr *>(&raddr), &rlen);
+		if (conn_fd < 0)
 		{
-			break;
-		}
-
-		n_flow_queries = ntohl(n_flow_queries);
-
-		// read that many IP addresses now.
-		auto flow_ips = std::vector<uint32_t>(n_flow_queries);
-		auto fip_size = n_flow_queries * sizeof(uint32_t);
-
-		if (read_val(new_conn, flow_ips.data(), fip_size, stats))
-		{
-			break;
-		}
-		auto inTime = ch::high_resolution_clock::now();
-
-		// Hacky -- assumes both ends are IEEE-754 compliant floats.
-		// This should give us everything we need though, gcc won't
-		// reorder structs thankfully.
-		auto stat_block = stats.clearAndRetrieveStats(startTime, flow_ips);
-
-		// send time since last read in ns...
-		if (send_val(new_conn, &stat_block.duration_ns, sizeof(int64_t), stats))
-		{
-			break;
-		}
-
-		// Okay, send byte values for all the standard loads...
-		for (auto b_val : stat_block.good_bytes)
-		{
-			if (send_val(new_conn, &b_val, sizeof(uint64_t), stats))
-			{
-				goto escape;
-			}
-		}
-		for (auto b_val : stat_block.bad_bytes)
-		{
-			if (send_val(new_conn, &b_val, sizeof(uint64_t), stats))
-			{
-				goto escape;
-			}
-		}
-
-		// And now, use the acquired ip addresses to
-		// ping along the relevant stat blocks!
-		for (auto &flow : stat_block.flows)
-		{
-			auto n_flows = (uint32_t)flow.size();
-			auto prep = htonl(n_flows);
-			if (send_val(new_conn, &prep, sizeof(uint32_t), stats))
-			{
-				goto escape;
-			}
-			if (n_flows < 1)
-			{
+			if (errno == EINTR)
 				continue;
-			}
-			if (send_val(new_conn, flow.data(), n_flows * sizeof(FlowMeasurement), stats))
+			perror("accept");
+			break;
+		}
+
+		// 3) Per-connection request/response loop
+		while (!stats.finished())
+		{
+			// Read a u32: number of flow IP queries (network byte order)
+			uint32_t n_flow_queries = 0;
+			if (read_val(conn_fd, &n_flow_queries, sizeof(n_flow_queries), stats))
 			{
-				goto escape;
+// client disconnected or error
+#ifdef DEBUG
+				std::cout << "Error reading the flow number" << std::endl;
+#endif
+				break;
+			}
+			n_flow_queries = ntohl(n_flow_queries);
+#ifdef DEBUG
+			std::cout << "Got a query for " << n_flow_queries << endl;
+#endif
+			// Read that many IPs (each u32 in network byte order).
+			std::vector<uint32_t> flow_ips(n_flow_queries);
+			if (n_flow_queries > 0)
+			{
+				const size_t fip_bytes = n_flow_queries * sizeof(uint32_t);
+				if (read_val(conn_fd, flow_ips.data(), fip_bytes, stats))
+				{
+					perror("Error reading flow bytes\n");
+					break;
+				}
+#ifdef DEBUG
+				for (auto ip : flow_ips)
+				{
+					std::cout << "I got IP address " << ip << std::endl;
+				}
+#endif
+				// NOTE: We keep them in network byte order intentionally.
+				// The snapshot code compares raw u32 host addresses as stored
+				// from packets; Python must send them packed as "!I".
+			}
+			const auto inTime = ch::high_resolution_clock::now();
+
+			// Build a snapshot ending "now".
+			// This also resets per-window counters for the next tick.
+			ValueSet stat_block = stats.clearAndRetrieveStats(startTime, flow_ips); // returns time, duration_ns, good_bytes, bad_bytes, flows
+			// Protocol framing expected by Python's ask_stats():
+			//  - int64_t duration_ns
+			//  - good_bytes[2*N] then bad_bytes[2*N]
+			//  - for each important interface: u32 n_flows (network order), then n_flows * sizeof(FlowMeasurement)
+
+			// Header: duration (ns)
+			if (send_val(conn_fd, &stat_block.duration_ns, sizeof(int64_t), stats))
+				goto connection_done;
+
+			// Per-interface bytes (good then bad)
+			for (uint64_t b : stat_block.good_bytes)
+			{
+				if (send_val(conn_fd, &b, sizeof(uint64_t), stats))
+					goto connection_done;
+			}
+			for (uint64_t b : stat_block.bad_bytes)
+			{
+				if (send_val(conn_fd, &b, sizeof(uint64_t), stats))
+					goto connection_done;
+			}
+
+			// Per-interface flow blocks
+			for (const auto &flow_vec : stat_block.flows)
+			{
+				uint32_t n_flows = static_cast<uint32_t>(flow_vec.size());
+				uint32_t n_flows_net = htonl(n_flows);
+#ifdef DEBUG
+
+#endif
+				if (send_val(conn_fd, &n_flows_net, sizeof(uint32_t), stats))
+					goto connection_done;
+
+				if (n_flows > 0)
+				{
+					// FlowMeasurement layout must match Python's struct ("=q6Q6fI4x")
+					// Ensure your compiler keeps the expected 88-byte size (the program prints it at startup).
+					const size_t payload = n_flows * sizeof(FlowMeasurement);
+					if (send_val(conn_fd, const_cast<FlowMeasurement *>(flow_vec.data()), payload, stats))
+					{
+						goto connection_done;
+					}
+				}
+			}
+
+			// Advance the next window start to the snapshot's time
+			startTime = stat_block.time;
+
+			const auto outTime = ch::high_resolution_clock::now();
+			if (TIME_PRINT_ERR)
+			{
+				std::cerr << "C-time:" << ch::nanoseconds(outTime - inTime).count() / 1000000 << std::endl;
 			}
 		}
 
-		startTime = stat_block.time;
-		auto outTime = ch::high_resolution_clock::now();
-		if (TIME_PRINT_ERR)
-		{
-			std::cerr << "C-time:" << ch::nanoseconds(outTime - inTime).count() / 1000000 << std::endl;
-		}
+	connection_done:
+		shutdown(conn_fd, SHUT_RDWR);
+		close(conn_fd);
+		// Loop back to accept a fresh client (or exit if stats.finished()).
 	}
 
-	// Donezo.
-escape:
-	shutdown(new_conn, SHUT_RDWR);
-	close(new_conn);
+	// 4) Clean up the listener
 	close(server_fd);
+	// (SOCKET_PATH will be unlinked on next bind; optional runtime unlink here)
+	// unlink(SOCKET_PATH);
 	std::this_thread::yield();
 }
-*/
 
 static void do_join(std::thread &t)
 {
@@ -1464,10 +1290,11 @@ int main(int argc, char const *argv[])
 		// We want to catch any which start with a '!', these are]
 		// important
 		auto name = argv[start_pos + i];
-		auto individual_stats = name[0] == '!';
+		// auto individual_stats = name[0] == '!';
+		auto individual_stats = true;
 		if (individual_stats)
 		{
-			name = &(name[1]);
+			// name = &(name[1]);
 			stats.markImportant(i);
 		}
 

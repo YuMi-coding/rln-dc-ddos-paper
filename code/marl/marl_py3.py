@@ -1399,19 +1399,13 @@ def marlExperiment(
             LOG.warning("[INFO] Pre-run Mininet CLI. Type 'exit' to start the experiment.")
             CLI(net)
 
+        sanitized_links = [n.lstrip('!') for n in monitored_links]
         print("monitored_links raw:", monitored_links)
-        print("monitored_links sanitized:", [n.lstrip('!') for n in monitored_links])
-        # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon"] + (["-s"] if bw_mon_socketed else []) + monitored_links, stdin=PIPE, stderr=sys.stderr)
-
-        # mon_cmd = server_switch.popen(["../marl-bwmon/marl-bwmon", "-s"] + monitored_links, stdin=PIPE, stderr=sys.stderr)
-        # bw_ifaces = [name.lstrip('!') for name in monitored_links]
-
-        # bw_mon_socketed = False # XXX mon_cmd is always socketed for now
-        # unix_sock = True
+        print("monitored_links sanitized:", sanitized_links)
 
         bw_sock = None
         if bw_mon_socketed:
-            bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + monitored_links
+            bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + sanitized_links
             # print("starting bwmon as:", " ".join(bwmon_command))
             LOG.info("starting bwmon as: %s", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
@@ -1437,95 +1431,19 @@ def marlExperiment(
                 print("[bwmon] warm-up failed:", e)
 
             sz_packer = struct.Struct("!I")
-            ip_packer = struct.Struct("!I")
+            ip_packer = struct.Struct("=I")
             time_packer = struct.Struct("=q")
             bytes_packer = struct.Struct("=Q")
             fm_packer = struct.Struct("=q6Q6fI4x")
 
-            # def ask_stats(flows, n_ifs, n_agents):
-            #     intime = time.time()
-            #     bw_sock.sendall(sz_packer.pack(len(flows)))
-            #     flow_data = b"".join(ip_packer.pack(f) for f in flows)
-            #     outtime = time.time()
-            #     bw_sock.sendall(flow_data)
-            #     if print_times: print("interlude:", outtime - intime)
-
-            #     def read_n(n, recvd):
-            #         deadline = time.time() + 5.0
-            #         while len(recvd) < n:
-            #             if time.time() > deadline:
-            #                 raise TimeoutError(f"bwmon read timeout waiting for {n} bytes")
-            #             try:
-            #                 t = bw_sock.recv(4096)
-            #             except socket.timeout:
-            #                 continue
-            #             except socket.error as e:
-            #                 err = e.args[0]
-            #                 if err in (errno.EAGAIN, errno.EWOULDBLOCK):
-            #                     continue
-            #                 else:
-            #                     print("socket read error"); sys.exit(1)
-            #             else:
-            #                 recvd += t
-            #         return recvd
-
-            #     recvd = b""
-            #     recvd = read_n(8, recvd)
-            #     (time_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
-
-            #     list_sz = n_ifs * 8 * 2
-            #     full = list_sz # * 2
-            #     recvd = read_n(full, recvd)
-
-            #     def mbpsify(bts): return 8000*float(bts)/time_ns
-
-            #     # parse only 2*n_ifs counters, not 4*n_ifs
-            #     goods, bads = [], []
-            #     for i in range(n_ifs * 2):
-            #         idx = i * 8
-            #         (val,) = bytes_packer.unpack(recvd[idx: idx+8])
-            #         # build (in_good,in_bad),(out_good,out_bad),...
-            #         if i % 2 == 0:
-            #             goods.append(val)
-            #         else:
-            #             bads.append(val)
-            #     # unfused_load_mbps = [pair for pair in zip(goods, bads)]
-            #     unfused_load_mbps = []
-            #     for k in range(n_ifs):
-            #         ig, ib = goods[k], bads[k]         # IN pair
-            #         og, ob = goods[k + 0], bads[k + 0] # if bwmon orders IN then OUT separately, adjust indexing accordingly
-            #     pairs = []
-            #     for i in range(0, n_ifs*2, 1):
-            #         (val,) = bytes_packer.unpack(recvd[i*8:(i+1)*8])
-            #         pairs.append(val)
-            #     recvd = recvd[full:]
-
-            #     parsed_flows = []
-            #     for _ in range(n_agents):
-            #         recvd = read_n(4, recvd)
-            #         (n_flow_entries,) = sz_packer.unpack(recvd[:4]); recvd = recvd[4:]
-            #         l_flows = []
-            #         stat_struct_len = 88
-            #         for _ in range(n_flow_entries):
-            #             recvd = read_n(stat_struct_len, recvd)
-            #             datas = list(fm_packer.unpack(recvd[:stat_struct_len]))
-            #             recvd = recvd[stat_struct_len:]
-            #             if datas[-1] != 0:
-            #                 l_flows.append((datas[-1], tuple(datas[0:5] + datas[7:9] + [datas[5]] + datas[9:11] + [datas[6]] + datas[11:13])))
-            #         parsed_flows.append(l_flows)
-            #     return (time_ns, unfused_load_mbps, parsed_flows)
-
             def ask_stats(flows, n_ifs, n_agents):
                 # 0) send flow list
+                LOG.debug("[bwmon] ask_stats: asking for %d flows: %s", len(flows), [int_to_ip(f) for f in flows])
                 bw_sock.sendall(sz_packer.pack(len(flows)))
                 if flows:
-                    bw_sock.sendall(b"".join(ip_packer.pack(f) for f in flows))
-
-                # NEW: tick the daemon to produce one snapshot
-                # try:
-                #     bw_sock.sendall(b"\n")
-                # except BrokenPipeError:
-                #     pass
+                    msg = b"".join(ip_packer.pack(f) for f in flows)
+                    LOG.debug("[bwmon] ask_stats: sending %d bytes of flows, data is %s", len(msg), msg)
+                    bw_sock.sendall(msg)
 
                 def read_n_at_least(n_min, n_try, recvd, timeout=10.0):
                     deadline = time.time() + timeout
@@ -1557,47 +1475,26 @@ def marlExperiment(
                 # 1) time_ns
                 recvd = read_n_at_least(8, 8, recvd)
                 if len(recvd) < 8:
-                    raise TimeoutError("bwmon read timeout waiting for time_ns (8 bytes)")
-                (time_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
-                if time_ns <= 0:
-                    time_ns = 1
+                    raise TimeoutError("bwmon read timeout waiting for window_ns (8 bytes)")
+                (win_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
+                if win_ns <= 0:
+                    win_ns = 1
+                time_ns = win_ns  # bwmon reports elapsed time as the window size
 
                 # 2) counters (accept either 4*n_ifs or 2*n_ifs uint64s)
-                need_AB = n_ifs * 8 * 4
-                need_C  = n_ifs * 8 * 2
-                recvd = read_n_at_least(need_C, need_AB, recvd)
-                have = len(recvd)
+                need = 4 * n_ifs * 8
+                recvd = read_n_at_least(need, need, recvd)
+                if len(recvd) < need:
+                    raise TimeoutError(f"bwmon read timeout waiting for counters (got {len(recvd)}/{need})")
+
+                data = recvd[:need]; recvd = recvd[need:]
+
+                vals  = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(4*n_ifs)]
+                goods = vals[:2*n_ifs]
+                bads  = vals[2*n_ifs:]
 
                 def mbpsify(u64b): return 8000.0 * float(u64b) / float(time_ns)
-                unfused_load_mbps = []
-
-                if have >= need_AB:
-                    data = recvd[:need_AB]; recvd = recvd[need_AB:]
-                    vals = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(4*n_ifs)]
-
-                    # Try interleaved: [IN_g, IN_b, OUT_g, OUT_b] * n_ifs
-                    inter = []
-                    nz_out = 0
-                    for i in range(n_ifs):
-                        in_g, in_b, out_g, out_b = vals[4*i:4*i+4]
-                        inter.append((mbpsify(in_g),  mbpsify(in_b)))
-                        inter.append((mbpsify(out_g), mbpsify(out_b)))
-                        if (out_g | out_b) != 0:
-                            nz_out += 1
-
-                    # Try split goods/bads: first 2*n_ifs goods, next 2*n_ifs bads
-                    goods, bads = vals[:2*n_ifs], vals[2*n_ifs:]
-                    split = [(mbpsify(goods[j]), mbpsify(bads[j])) for j in range(2*n_ifs)]
-
-                    unfused_load_mbps = inter if nz_out > 0 else split
-
-                elif have >= need_C:
-                    data = recvd[:need_C]; recvd = recvd[need_C:]
-                    totals = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(2*n_ifs)]
-                    unfused_load_mbps = [(mbpsify(t), 0.0) for t in totals]
-                else:
-                    raise TimeoutError(f"bwmon read timeout waiting for counters "
-                                    f"(got {have} bytes, need at least {need_C})")
+                unfused_load_mbps = [(mbpsify(goods[j]), mbpsify(bads[j])) for j in range(2*n_ifs)]
 
                 # 3) (optional) per-agent flow blocks
                 parsed_flows = []
@@ -1625,12 +1522,23 @@ def marlExperiment(
                     recvd = recvd[need:]
                     parsed_flows.append(l_flows)
 
+                # After building parsed_flows:
+                if len(parsed_flows) != n_agents:
+                    LOG.warning("flow blocks received=%d but n_agents=%d; filling to match.",
+                                len(parsed_flows), n_agents)
+                    # pad or trim to n_agents to keep the rest of the code happy
+                    if len(parsed_flows) < n_agents:
+                        parsed_flows += [[] for _ in range(n_agents - len(parsed_flows))]
+                    else:
+                        parsed_flows = parsed_flows[:n_agents]
+
+
                 return (time_ns, unfused_load_mbps, parsed_flows)
 
 
 
         else:
-            bwmon_command = ["../marl-bwmon/marl-bwmon"] + monitored_links
+            bwmon_command = ["../marl-bwmon/marl-bwmon"] + sanitized_links
             # print("starting bwmon as:", " ".join(bwmon_command))
             LOG.info("starting bwmon as: %s", " ".join(bwmon_command))
             mon_cmd = server_switch.popen(
@@ -1638,42 +1546,7 @@ def marlExperiment(
                 stdin=PIPE, stdout=PIPE, stderr=sys.stderr
             )
             tee_process_stdout(mon_cmd, "[bwmon] ")
-            # def ask_stats(_flows, _n_ifs, _n_agents):
-            #     mon_cmd.stdin.write(b"\n")
-            #     mon_cmd.stdin.flush()
-            #     data = mon_cmd.stdout.readline().strip().decode().split(",")
-            #     flow_stat_str = mon_cmd.stdout.readline().strip().decode()
-            #     flow_stat_break = flow_stat_str.split("]")
-            #     split_stats = [s.strip().split("[")[-1] for s in flow_stat_break if len(s) > 0]
-            #     almost_subs = [s.split(")") if len(s) > 0 else "" for s in split_stats]
-            #     subs = []
-            #     for set_str in almost_subs:
-            #         subs.append([a.split("(")[-1].split("|") for a in set_str])
 
-            #     parsed_flows = []
-            #     for l in subs:
-            #         layer = []
-            #         for e in l:
-            #             if not e or len(e[0]) == 0: continue
-            #             prop_holder = {}
-            #             for flow_prop_str in e[1:]:
-            #                 prop_str_parts = flow_prop_str.split(",")
-            #                 if len(prop_str_parts) < 2 or prop_str_parts[1] == "": continue
-            #                 props = [float(part) for part in prop_str_parts[1:]]
-            #                 prop_holder[prop_str_parts[0]] = props
-            #             if e[0] != "0.0.0.0":
-            #                 ip_bytes = socket.inet_pton(socket.AF_INET, e[0])
-            #                 layer.append((struct.unpack("I", ip_bytes)[0], prop_holder))
-            #         parsed_flows.append(layer)
-
-            #     while len(parsed_flows) < _n_agents:
-            #         parsed_flows.append([])
-
-            #     time_ns = int(data[0][:-2])
-            #     def mbpsify_bytes(bts): return 8000*float(bts)/time_ns
-            #     unfused_load_mbps = [list(map(mbpsify_bytes, el.strip().split(" "))) for el in data[1:]]
-            #     return (time_ns, unfused_load_mbps, parsed_flows)
-            # --- STDOUT MODE PARSER (replace your current non-socketed ask_stats) ---
             def ask_stats(_flows, n_ifs, n_agents):
                 # Trigger one snapshot
                 mon_cmd.stdin.write(b"\n")
@@ -1975,26 +1848,6 @@ def marlExperiment(
                     return winner
                 hash_fn = smart_hash if actions_target_flows else dumb_hash
 
-                # def indices_for_state_vec(dst_ip, src_ip, show_choices=False):
-                #     curr = node_label
-                #     end = dest_from_ip[dst_ip]
-                #     path = [curr]
-                #     while curr != end:
-                #         next_set = list(dest_map[curr][end])
-                #         curr = next_set[hash_fn(len(next_set), src_ip, dst_ip, host_ip_mac_map.get(src_ip, "00:00:00:00:00:00"))]
-                #         path.append(curr)
-                #     path.reverse()
-                #     parts = list(zip(path, path[1:]))
-                #     h0 = parts[0]; h3 = parts[-1]
-                #     internals = []
-                #     if len(parts) == 1:
-                #         internals = [h0, h3]
-                #     else:
-                #         usables = parts[1:-1]
-                #         tert_pt = float(len(usables)) / 3.0
-                #         internals.append(usables[int(tert_pt)])
-                #         internals.append(usables[int(tert_pt*2)])
-                #     return [h0] + internals + [h3]
                 def indices_for_state_vec(dst_ip, src_ip, show_choices=False):
                     # normalize dst_ip to dotted-quad string
                     if isinstance(dst_ip, (int, np.integer)):
