@@ -993,45 +993,91 @@ static void monitorInterface(pcap_t *iface, const int index, InterfaceStats &sta
 
 static bool read_val(int fd, void *location, size_t len, InterfaceStats &stats)
 {
-	auto remaining = len;
-	auto err = false;
-
-	timeval tv;
-	fd_set selector;
-
-	while (remaining && !err)
+	size_t remaining = len;
+	while (remaining && !stats.finished())
 	{
-		tv.tv_sec = 1;
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+
+		struct timeval tv;
+		tv.tv_sec = 5; // give the client time between requests
 		tv.tv_usec = 0;
 
-		FD_ZERO(&selector);
-		FD_SET(fd, &selector);
-		select(fd + 1, &selector, nullptr, nullptr, &tv);
-
-		auto bytes_read = 0;
-
-		if (FD_ISSET(fd, &selector))
+		int r = select(fd + 1, &rfds, nullptr, nullptr, &tv);
+		if (r == 0)
 		{
-			bytes_read = recv(
-				fd,
-				(reinterpret_cast<char *>(location)) + (len - remaining),
-				remaining,
-				0);
+			// timeout -> just wait again, do NOT treat as error
+			continue;
+		}
+		if (r < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return true; // error
 		}
 
-		if (bytes_read < 0 || stats.finished())
+		ssize_t n = recv(fd,
+						 (reinterpret_cast<char *>(location)) + (len - remaining),
+						 remaining, 0);
+		if (n == 0)
 		{
-			err = true;
-			break;
+			// real EOF (peer closed)
+			return true;
 		}
-		else
+		if (n < 0)
 		{
-			remaining -= bytes_read;
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			return true;
 		}
+		remaining -= static_cast<size_t>(n);
 	}
-
-	return err;
+	return false; // success
 }
+
+// static bool read_val(int fd, void *location, size_t len, InterfaceStats &stats)
+// {
+// 	auto remaining = len;
+// 	auto err = false;
+
+// 	timeval tv;
+// 	fd_set selector;
+
+// 	while (remaining && !err)
+// 	{
+// 		tv.tv_sec = 1;
+// 		tv.tv_usec = 0;
+
+// 		FD_ZERO(&selector);
+// 		FD_SET(fd, &selector);
+// 		select(fd + 1, &selector, nullptr, nullptr, &tv);
+
+// 		ssize_t bytes_read = 0;
+
+// 		if (FD_ISSET(fd, &selector))
+// 		{
+// 			bytes_read = recv(
+// 				fd,
+// 				(reinterpret_cast<char *>(location)) + (len - remaining),
+// 				remaining,
+// 				0);
+// 		}
+
+// 		// bytes_read == 0 means peer closed -> treat as error to unwind cleanly
+// 		if (bytes_read <= 0 || stats.finished())
+// 		{
+// 			err = true;
+// 			break;
+// 		}
+// 		else
+// 		{
+// 			remaining -= bytes_read;
+// 		}
+// 	}
+
+// 	return err;
+// }
 
 static bool send_val(int fd, void *location, size_t len, InterfaceStats &stats)
 {
@@ -1101,7 +1147,7 @@ static void server_runner(InterfaceStats &stats)
 	// Allow non-root Python to connect if needed
 	chmod(SOCKET_PATH, 0666);
 
-	if (listen(server_fd, 1) < 0)
+	if (listen(server_fd, 64) < 0) // FIXED: 2025-09-18: prevent the ECONNREFUSE
 	{
 		perror("listen");
 		close(server_fd);
@@ -1218,7 +1264,7 @@ static void server_runner(InterfaceStats &stats)
 				std::cerr << "C-time:" << ch::nanoseconds(outTime - inTime).count() / 1000000 << std::endl;
 			}
 		}
-
+		// std::cout << "Connection terminated.\n";
 	connection_done:
 		shutdown(conn_fd, SHUT_RDWR);
 		close(conn_fd);

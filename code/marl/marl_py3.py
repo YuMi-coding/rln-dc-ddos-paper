@@ -36,6 +36,7 @@ import builtins
 
 LOG = logging.getLogger("marl")
 LOG.propagate = False  # don't duplicate to root
+BW_SOCK_PATH = os.environ.get("BWMON_SOCK", "/tmp/bwmon-sock")
 
 def setup_logging(log_dir: str, level: str = "INFO") -> str:
     os.makedirs(log_dir, exist_ok=True)
@@ -93,6 +94,60 @@ def tee_process_stdout(proc, prefix: str):
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
     return t
+
+
+
+# On-wire/request
+_SZ_U32_BE       = struct.Struct("!I")   # count
+_IP_U32_BE       = struct.Struct("!I")   # IPs we send
+
+# Reply header/counters (native on your build)
+_TIME_I64_NATIVE = struct.Struct("=q")
+_U64_NATIVE      = struct.Struct("=Q")
+
+# FlowMeasurement head (80 bytes native): q, 6Q, 6f
+_FM_HEAD_NATIVE  = struct.Struct("=q6Q6f")
+_FM_SIZE         = 88  # 80 + ip:u32 + pad4
+
+def _read_exact(sock, nbytes: int, deadline: float) -> bytes:
+    buf = bytearray()
+    end = time.time() + float(deadline)
+    while len(buf) < nbytes:
+        rem = end - time.time()
+        if rem <= 0:
+            raise TimeoutError(f"timed out waiting for {nbytes} bytes, got {len(buf)}")
+        sock.settimeout(rem)
+        chunk = sock.recv(nbytes - len(buf))
+        if not chunk:
+            raise TimeoutError(f"peer closed while waiting for {nbytes} bytes, got {len(buf)}")
+        buf.extend(chunk)
+    sock.settimeout(None)
+    return bytes(buf)
+
+def _ip_be_to_str(u32_be: int) -> str:
+    return socket.inet_ntoa(struct.pack("!I", u32_be & 0xffffffff))
+
+def _connect_unix(path, retries=12, init_delay=0.02, max_delay=0.25, timeout=2.0):
+    """
+    Connect to a UNIX domain socket with a short retry/backoff.
+    Returns a *blocking* socket (no per-call settimeout).
+    """
+    delay = float(init_delay)
+    last_exc = None
+    for _ in range(int(retries)):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(timeout)
+            s.connect(path)
+            s.settimeout(None)  # back to blocking; we do our own deadlines in _read_exact
+            return s
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError) as e:
+            last_exc = e
+            try: s.close()
+            except: pass
+            time.sleep(delay)
+            delay = min(max_delay, delay * 1.6)
+    raise ConnectionError(f"could not connect to {path}: {last_exc}")
 # RL & state machines (your local modules)
 from sarsa_py3 import SarsaLearner, QLearner
 from spf_py3 import *  # SpfMachine, MarlMachine, etc.
@@ -1231,6 +1286,16 @@ def marlExperiment(
             name = vertex_map[actor].name
             learner_pos[name] = len(learner_name)
             learner_name.append(name)
+        # Build interface→agent map using the raw monitored_links (with '!' on learner links)
+        if_to_agent = []
+        for name in monitored_links:
+            is_learner_link = name.startswith('!')
+            base = name.lstrip('!')
+            swname = base.split('-')[0]  # e.g., 's4' from 's4-eth1'
+            if is_learner_link and swname in learner_pos:
+                if_to_agent.append(learner_pos[swname])
+            else:
+                if_to_agent.append(None)
 
         mon_reporter = MonitorReporter(
             log_dir=log_dir,
@@ -1329,6 +1394,7 @@ def marlExperiment(
                     data_sock.close()
             finally:
                 sock.close()
+        # End of use_controller block
 
         host_procs = []
         bw_all = [0.0 for _ in range(3)]
@@ -1403,7 +1469,6 @@ def marlExperiment(
         print("monitored_links raw:", monitored_links)
         print("monitored_links sanitized:", sanitized_links)
 
-        bw_sock = None
         if bw_mon_socketed:
             bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + sanitized_links
             # print("starting bwmon as:", " ".join(bwmon_command))
@@ -1414,126 +1479,100 @@ def marlExperiment(
             )
             tee_process_stdout(mon_cmd, "[bwmon] ")
             time.sleep(0.5)
-            if unix_sock:
-                bw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                bw_sock.connect("/tmp/bwmon-sock")
-                bw_sock.settimeout(5.0)  # after connect
-            else:
-                bw_sock = socket.create_connection(("127.0.0.1", stats_port))
-            # bw_sock.setblocking(0)
+            # Persistent bwmon socket (mutated in inner scope)
+            bw_sock = [None]
 
-            try:
-                bw_sock.sendall(struct.pack("!I", 0))  # zero flows
-                # expect 8 bytes header back (time_ns); if this times out, protocol still mismatched
-                time.sleep(0.1)
-                _hdr = bw_sock.recv(8)
-            except Exception as e:
-                print("[bwmon] warm-up failed:", e)
-
-            sz_packer = struct.Struct("!I")
-            ip_packer = struct.Struct("=I")
-            time_packer = struct.Struct("=q")
-            bytes_packer = struct.Struct("=Q")
-            fm_packer = struct.Struct("=q6Q6fI4x")
-
-            def ask_stats(flows, n_ifs, n_agents):
-                # 0) send flow list
-                LOG.debug("[bwmon] ask_stats: asking for %d flows: %s", len(flows), [int_to_ip(f) for f in flows])
-                bw_sock.sendall(sz_packer.pack(len(flows)))
-                if flows:
-                    msg = b"".join(ip_packer.pack(f) for f in flows)
-                    LOG.debug("[bwmon] ask_stats: sending %d bytes of flows, data is %s", len(msg), msg)
-                    bw_sock.sendall(msg)
-
-                def read_n_at_least(n_min, n_try, recvd, timeout=10.0):
-                    deadline = time.time() + timeout
-                    while len(recvd) < n_min and time.time() < deadline:
+            def _bw_open():
+                # (Re)open the persistent socket to bwmon
+                try:
+                    if bw_sock[0] is not None:
                         try:
-                            chunk = bw_sock.recv(4096)
-                        except (socket.timeout, BlockingIOError):
-                            continue
-                        except OSError as e:
-                            if getattr(e, "errno", None) in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                continue
-                            raise
-                        if not chunk:
-                            break
-                        recvd += chunk
-                    # opportunistically top up to n_try if available
-                    while len(recvd) < n_try and time.time() < deadline:
-                        try:
-                            chunk = bw_sock.recv(4096)
-                            if not chunk:
-                                break
-                            recvd += chunk
+                            bw_sock[0].shutdown(socket.SHUT_RDWR)
                         except Exception:
-                            break
-                    return recvd
+                            pass
+                        bw_sock[0].close()
+                except Exception:
+                    pass
+                bw_sock[0] = _connect_unix(BW_SOCK_PATH)
 
-                recvd = b""
+            # initial connect
+            _bw_open()
 
-                # 1) time_ns
-                recvd = read_n_at_least(8, 8, recvd)
-                if len(recvd) < 8:
-                    raise TimeoutError("bwmon read timeout waiting for window_ns (8 bytes)")
-                (win_ns,) = time_packer.unpack(recvd[:8]); recvd = recvd[8:]
-                if win_ns <= 0:
-                    win_ns = 1
-                time_ns = win_ns  # bwmon reports elapsed time as the window size
+            def ask_stats(flows_be, n_ifs, n_agents,
+                        hdr_deadline: float = 5.0,
+                        agent_deadline: float = 5.0):
 
-                # 2) counters (accept either 4*n_ifs or 2*n_ifs uint64s)
-                need = 4 * n_ifs * 8
-                recvd = read_n_at_least(need, need, recvd)
-                if len(recvd) < need:
-                    raise TimeoutError(f"bwmon read timeout waiting for counters (got {len(recvd)}/{need})")
+                flows_be = list(flows_be)
 
-                data = recvd[:need]; recvd = recvd[need:]
+                def _one_round(send_socket):
+                    LOG.debug("[bwmon] ask_stats: query_size=%d", len(flows_be))
+                    if flows_be:
+                        LOG.debug("[bwmon] flows: %s", [_ip_be_to_str(x) for x in flows_be])
 
-                vals  = [bytes_packer.unpack(data[i*8:(i+1)*8])[0] for i in range(4*n_ifs)]
-                goods = vals[:2*n_ifs]
-                bads  = vals[2*n_ifs:]
+                    # 1) send request
+                    send_socket.sendall(_SZ_U32_BE.pack(len(flows_be)))
+                    if flows_be:
+                        send_socket.sendall(b"".join(_IP_U32_BE.pack(x & 0xffffffff) for x in flows_be))
 
-                def mbpsify(u64b): return 8000.0 * float(u64b) / float(time_ns)
-                unfused_load_mbps = [(mbpsify(goods[j]), mbpsify(bads[j])) for j in range(2*n_ifs)]
+                    # 2) header: time + goods + bads
+                    t_bytes = _read_exact(send_socket, _TIME_I64_NATIVE.size, hdr_deadline)
+                    (time_ns,) = _TIME_I64_NATIVE.unpack(t_bytes)
+                    time_ns = max(1, int(time_ns))
 
-                # 3) (optional) per-agent flow blocks
-                parsed_flows = []
-                for _ in range(n_agents):
-                    recvd = read_n_at_least(4, 4, recvd)
-                    if len(recvd) < 4:
-                        parsed_flows.append([])
-                        continue
-                    (n_flow_entries,) = sz_packer.unpack(recvd[:4]); recvd = recvd[4:]
-                    need = n_flow_entries * 88
-                    recvd = read_n_at_least(need, need, recvd)
-                    if len(recvd) < need:
-                        parsed_flows.append([])
-                        recvd = b""
-                        continue
-                    l_flows, off = [], 0
-                    for _ in range(n_flow_entries):
-                        chunk = recvd[off:off+88]; off += 88
-                        datas = list(fm_packer.unpack(chunk))
-                        if datas[-1] != 0:
-                            l_flows.append(
-                                (datas[-1],
-                                tuple(datas[0:5] + datas[7:9] + [datas[5]] + datas[9:11] + [datas[6]] + datas[11:13]))
+                    cnt_bytes = _read_exact(send_socket, 4 * n_ifs * _U64_NATIVE.size, hdr_deadline)
+                    vals = list(struct.unpack(f"={4*n_ifs}Q", cnt_bytes))
+                    goods = vals[:2*n_ifs]; bads = vals[2*n_ifs:]
+
+                    def mbps(u64bytes): return 8000.0 * float(u64bytes) / float(time_ns)
+                    unfused_load_mbps = [(mbps(goods[j]), mbps(bads[j])) for j in range(2*n_ifs)]
+
+                    # 3) per-interface blocks (read ALL of them)
+                    per_agent = [[] for _ in range(n_agents)]
+                    for if_idx in range(n_ifs):
+                        raw = _read_exact(send_socket, 4, agent_deadline)
+                        (n_entries_be,) = struct.unpack("!I", raw)
+                        n_entries = n_entries_be
+                        if n_entries > 100000:  # sanity fallback
+                            (n_entries_native,) = struct.unpack("=I", raw)
+                            if n_entries_native <= 100000:
+                                LOG.warning("[bwmon] if %d: BE count %d insane; using native %d",
+                                            if_idx, n_entries_be, n_entries_native)
+                                n_entries = n_entries_native
+
+                        flows_here = []
+                        for _ in range(n_entries):
+                            rec = _read_exact(send_socket, _FM_SIZE, agent_deadline)
+                            head = _FM_HEAD_NATIVE.unpack(rec[:_FM_HEAD_NATIVE.size])
+                            (ip_be,) = struct.unpack("!I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
+                            if ip_be == 0:
+                                continue
+                            fl_len = head[0]
+                            size_in, size_out, d_in, d_out = head[1], head[2], head[3], head[4]
+                            pkt_in_cnt, pkt_out_cnt = head[5], head[6]
+                            pin_mean, pin_var = head[7], head[8]
+                            pout_mean, pout_var = head[9], head[10]
+                            iat_mean, iat_var = head[11], head[12]
+                            props = (
+                                fl_len, size_in, size_out, d_in, d_out,
+                                pin_mean, pin_var, pkt_in_cnt,
+                                pout_mean, pout_var, pkt_out_cnt,
+                                iat_mean, iat_var
                             )
-                    recvd = recvd[need:]
-                    parsed_flows.append(l_flows)
+                            flows_here.append((ip_be, props))
 
-                # After building parsed_flows:
-                if len(parsed_flows) != n_agents:
-                    LOG.warning("flow blocks received=%d but n_agents=%d; filling to match.",
-                                len(parsed_flows), n_agents)
-                    # pad or trim to n_agents to keep the rest of the code happy
-                    if len(parsed_flows) < n_agents:
-                        parsed_flows += [[] for _ in range(n_agents - len(parsed_flows))]
-                    else:
-                        parsed_flows = parsed_flows[:n_agents]
+                        agent_idx = if_to_agent[if_idx]
+                        if agent_idx is not None and 0 <= agent_idx < n_agents:
+                            per_agent[agent_idx].extend(flows_here)
+                        # else: it's a non-learner link; ignore its blocks
 
+                    return (time_ns, unfused_load_mbps, per_agent)
 
-                return (time_ns, unfused_load_mbps, parsed_flows)
+                try:
+                    return _one_round(bw_sock[0])
+                except (TimeoutError, BrokenPipeError, ConnectionError, OSError) as e:
+                    LOG.warning("[bwmon] socket error (%s); reconnecting once...", e)
+                    _bw_open()
+                    return _one_round(bw_sock[0])
 
 
 
@@ -1635,6 +1674,8 @@ def marlExperiment(
                 for cmd in cmds:
                     server_procs.append(dest.popen(cmd, stdin=PIPE, stderr=sys.stderr))
                     tee_process_stdout(server_procs[-1], f"[srv{dest_node[0][0]}] ")
+
+        # End of BWMON setup
 
         for (host, good, bw, link, ip, extern_no, sm) in all_hosts:
             target_dest = dests[0] if len(dests) == 1 else dests[random.randint(0, len(dests)-1)]
@@ -2028,16 +2069,6 @@ def marlExperiment(
                                 dat = learner_traces[l_index][ip_pair]
                                 (st, z, narrowing_in_use) = dat[0][s_ac_num]
                                 machine = dat[2]
-                                # allow_update_narrowing = False
-                                # allow_action_narrowing = False
-                                # if narrowing_in_use is None and (np.random.uniform() < s.get_epsilon() * explore_feature_isolation_modifier):
-                                #     mod = 1 if always_include_global else 0
-                                #     narrowing_in_use = [explore_feature_isolation_duration, ([0] if always_include_global else []) + [np.random.choice(s.tiling_set_count-mod)+mod]]
-                                #     allow_action_narrowing = True
-                                # elif narrowing_in_use is not None:
-                                #     narrowing_in_use[0] -= 1
-                                #     allow_update_narrowing = True
-                                #     allow_action_narrowing = narrowing_in_use[0] > 0
 
                                 allow_update_narrowing = False
                                 allow_action_narrowing = False
@@ -2151,13 +2182,25 @@ def marlExperiment(
         # print("good:", last_traffic_ratio, ", g_reward:", g_reward, ", selected:", reward)
 
         print(f"good: {last_iter_snapshot['good']} , "
-      f"g_reward: {last_iter_snapshot['g_reward']} , "
-      f"selected: {last_iter_snapshot['selected']}")
+        f"g_reward: {last_iter_snapshot['g_reward']} , "
+        f"selected: {last_iter_snapshot['selected']}")
         # Only drop into CLI after the very last episode
         is_last_episode = (ep == episodes - 1)
         if interactive_cli_post and is_last_episode:
             print("[INFO] Final post-run Mininet CLI (after last episode). 'exit' to clean up.")
             CLI(net)
+
+        try:
+            if bw_mon_socketed and bw_sock[0] is not None:
+                try:
+                    bw_sock[0].shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                bw_sock[0].close()
+                bw_sock[0] = None
+        except Exception:
+            LOG.debug("bwmon socket cleanup failed", exc_info=True)
+
         mon_cmd.stdin.close()
 
         # Close monitor reporter
@@ -2165,13 +2208,6 @@ def marlExperiment(
             mon_reporter.close()
         except Exception:
             pass
-
-        if bw_sock is not None:
-            try:
-                bw_sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            bw_sock.close()
 
         for server_proc in server_procs:
             try: server_proc.terminate()
