@@ -610,7 +610,9 @@ public:
 						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
 						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
 
-					const bool wanted = is_new || match_external;
+					const bool wanted =
+						is_new ||
+						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
 
 #ifdef DEBUG
 					std::cout << "Finding internal ip " << internal_ip << std::endl;
@@ -1161,6 +1163,7 @@ static void server_runner(InterfaceStats &stats)
 		socklen_t rlen = sizeof(raddr);
 
 		int conn_fd = accept(server_fd, reinterpret_cast<sockaddr *>(&raddr), &rlen);
+		startTime = ch::high_resolution_clock::now();
 		if (conn_fd < 0)
 		{
 			if (errno == EINTR)

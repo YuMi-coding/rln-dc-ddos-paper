@@ -1471,14 +1471,11 @@ def marlExperiment(
 
         if bw_mon_socketed:
             bwmon_command = ["../marl-bwmon/marl-bwmon", "-s"] + sanitized_links
-            # print("starting bwmon as:", " ".join(bwmon_command))
             LOG.info("starting bwmon as: %s", " ".join(bwmon_command))
-            mon_cmd = server_switch.popen(
-                bwmon_command,
-                stdin=PIPE, stderr=sys.stderr
-            )
+            mon_cmd = server_switch.popen(bwmon_command, stdin=PIPE, stderr=sys.stderr)
             tee_process_stdout(mon_cmd, "[bwmon] ")
             time.sleep(0.5)
+
             # Persistent bwmon socket (mutated in inner scope)
             bw_sock = [None]
 
@@ -1509,30 +1506,41 @@ def marlExperiment(
                     if flows_be:
                         LOG.debug("[bwmon] flows: %s", [_ip_be_to_str(x) for x in flows_be])
 
-                    # 1) send request
+                    # -------------------------
+                    # 1) REQUEST (wire = network/big-endian)
+                    # count: !I, each ip: !I
                     send_socket.sendall(_SZ_U32_BE.pack(len(flows_be)))
                     if flows_be:
                         send_socket.sendall(b"".join(_IP_U32_BE.pack(x & 0xffffffff) for x in flows_be))
 
-                    # 2) header: time + goods + bads
+                    # -------------------------
+                    # 2) REPLY HEADER (native)
+                    # time_ns: =q, then 4*n_ifs * (=Q)
                     t_bytes = _read_exact(send_socket, _TIME_I64_NATIVE.size, hdr_deadline)
                     (time_ns,) = _TIME_I64_NATIVE.unpack(t_bytes)
                     time_ns = max(1, int(time_ns))
 
                     cnt_bytes = _read_exact(send_socket, 4 * n_ifs * _U64_NATIVE.size, hdr_deadline)
                     vals = list(struct.unpack(f"={4*n_ifs}Q", cnt_bytes))
-                    goods = vals[:2*n_ifs]; bads = vals[2*n_ifs:]
+                    goods = vals[:2*n_ifs]
+                    bads  = vals[2*n_ifs:]
 
                     def mbps(u64bytes): return 8000.0 * float(u64bytes) / float(time_ns)
                     unfused_load_mbps = [(mbps(goods[j]), mbps(bads[j])) for j in range(2*n_ifs)]
 
-                    # 3) per-interface blocks (read ALL of them)
+                    # -------------------------
+                    # 3) PER-INTERFACE FLOW BLOCKS
+                    # For each interface:
+                    #   n_entries: !I (network)
+                    #   records: n_entries * 88B
+                    #   FlowMeasurement head (80B): =q6Q6f (native)
+                    #   FlowMeasurement.ip (4B):   =I     (native)   <-- key line
                     per_agent = [[] for _ in range(n_agents)]
                     for if_idx in range(n_ifs):
                         raw = _read_exact(send_socket, 4, agent_deadline)
                         (n_entries_be,) = struct.unpack("!I", raw)
                         n_entries = n_entries_be
-                        if n_entries > 100000:  # sanity fallback
+                        if n_entries > 100000:  # sanity fallback if we ever see nonsense
                             (n_entries_native,) = struct.unpack("=I", raw)
                             if n_entries_native <= 100000:
                                 LOG.warning("[bwmon] if %d: BE count %d insane; using native %d",
@@ -1541,29 +1549,36 @@ def marlExperiment(
 
                         flows_here = []
                         for _ in range(n_entries):
-                            rec = _read_exact(send_socket, _FM_SIZE, agent_deadline)
+                            rec  = _read_exact(send_socket, _FM_SIZE, agent_deadline)
                             head = _FM_HEAD_NATIVE.unpack(rec[:_FM_HEAD_NATIVE.size])
-                            (ip_be,) = struct.unpack("!I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
-                            if ip_be == 0:
+                            # C++ sends the struct in native endianness → read ip with =I
+                            (ip_u32_native,) = struct.unpack("=I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
+                            if ip_u32_native == 0:
                                 continue
+
+                            # We store/print using big-endian *bytes* (dotted string uses network order).
+                            # ip_be_to_str expects the integer value and packs with !I internally,
+                            # so keeping the numeric here is fine.
+                            ip_val = ip_u32_native  # keep as numeric; ip_be_to_str() prints it correctly
+
                             fl_len = head[0]
                             size_in, size_out, d_in, d_out = head[1], head[2], head[3], head[4]
-                            pkt_in_cnt, pkt_out_cnt = head[5], head[6]
-                            pin_mean, pin_var = head[7], head[8]
-                            pout_mean, pout_var = head[9], head[10]
-                            iat_mean, iat_var = head[11], head[12]
+                            pkt_in_cnt, pkt_out_cnt        = head[5], head[6]
+                            pin_mean, pin_var              = head[7], head[8]
+                            pout_mean, pout_var            = head[9], head[10]
+                            iat_mean, iat_var              = head[11], head[12]
                             props = (
                                 fl_len, size_in, size_out, d_in, d_out,
                                 pin_mean, pin_var, pkt_in_cnt,
                                 pout_mean, pout_var, pkt_out_cnt,
                                 iat_mean, iat_var
                             )
-                            flows_here.append((ip_be, props))
+                            flows_here.append((ip_val, props))
 
                         agent_idx = if_to_agent[if_idx]
                         if agent_idx is not None and 0 <= agent_idx < n_agents:
                             per_agent[agent_idx].extend(flows_here)
-                        # else: it's a non-learner link; ignore its blocks
+                        # else: non-learner interface; ignore its flows
 
                     return (time_ns, unfused_load_mbps, per_agent)
 
@@ -1573,7 +1588,6 @@ def marlExperiment(
                     LOG.warning("[bwmon] socket error (%s); reconnecting once...", e)
                     _bw_open()
                     return _one_round(bw_sock[0])
-
 
 
         else:
