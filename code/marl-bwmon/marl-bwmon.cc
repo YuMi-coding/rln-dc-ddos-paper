@@ -605,14 +605,18 @@ public:
 					const uint32_t external_ip = ext_pair.first;  // outer_map key
 					const uint32_t external_ip_net = external_ip; // already network order if that is how stored
 					const uint32_t external_ip_host = ntohl(external_ip);
+					fm.ip = htonl(ext_pair.first);
 
+					// const bool match_external =
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
 					const bool match_external =
 						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
 						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
-
-					const bool wanted =
-						is_new ||
-						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
+					// const bool wanted =
+					// 	is_new ||
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
+					const bool wanted = is_new || match_external;
 
 #ifdef DEBUG
 					std::cout << "Finding internal ip " << internal_ip << std::endl;

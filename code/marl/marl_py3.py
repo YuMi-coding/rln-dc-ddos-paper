@@ -1976,12 +1976,29 @@ def marlExperiment(
                         sample = flows_seen[0]
                         # Socketed path returns (src_ip_int, props_tuple)
                         if isinstance(sample, tuple) and len(sample) == 2 and not isinstance(sample[1], dict):
-                            # If you have a single server, use that as dst.
-                            # Otherwise you can pick the hashed server like you already do elsewhere.
-                            default_dst_ip = list(dest_from_ip.keys())[0]  # string like "10.0.0.x"
-                            default_dst_ip_int = struct.unpack("!I", socket.inet_aton(default_dst_ip))[0]
+                            # Build once: list of candidate destination IPs (as native ints in network order)
+                            dest_ip_list = list(dest_from_ip.keys())  # ["10.0.0.1", "10.0.0.2", ...]
+                            dest_ip_ints = [struct.unpack("!I", socket.inet_aton(x))[0] for x in dest_ip_list]
+
+                            def _pick_dst_for_src(src_ip_int: int) -> int:
+                                """Stable per-flow dst pick:
+                                - single-destination: trivial
+                                - multi-destination: use the same hash you use for path selection
+                                """
+                                if len(dest_ip_ints) == 1:
+                                    return dest_ip_ints[0]
+                                mac = host_ip_mac_map.get(src_ip_int, "00:00:00:00:00:00")
+                                idx = hash_fn(len(dest_ip_ints), src_ip_int, 0, mac)
+                                return dest_ip_ints[idx]
+
                             for (src_ip_int, props_tuple) in flows_seen:
-                                norm_flows.append((src_ip_int, default_dst_ip_int, props_tuple))
+                                dst_ip_int = _pick_dst_for_src(src_ip_int)
+                                if src_ip_int == dst_ip_int and len(dest_ip_ints) > 1:
+                                    # extremely rare; re-roll with a different seed to avoid src==dst
+                                    mac = host_ip_mac_map.get(src_ip_int, "00:00:00:00:00:00")
+                                    idx2 = (hash_fn(len(dest_ip_ints), src_ip_int, 1, mac)) % len(dest_ip_ints)
+                                    dst_ip_int = dest_ip_ints[idx2]
+                                norm_flows.append((src_ip_int, dst_ip_int, props_tuple))
                         else:
                             # Legacy/non-socketed path: list of (src_ip_int, {dst_ip_str: props_tuple, ...})
                             for (src_ip_int, props_dict) in flows_seen:
