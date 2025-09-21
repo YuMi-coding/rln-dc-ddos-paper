@@ -599,35 +599,34 @@ public:
 
 					auto [is_new, fm] = *maybe;
 
-					// const bool wanted =
-					// 	is_new ||
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
-					// const uint32_t external_ip = ext_pair.first;  // outer_map key
-					// const uint32_t external_ip_net = external_ip; // already network order if that is how stored
-					// const uint32_t external_ip_host = ntohl(external_ip);
 					fm.ip = htonl(internal_ip);
+					uint32_t ip_int_be = htonl(internal_ip);
+					uint32_t ip_ext_be = htonl(ext_pair.first);
+					std::memcpy(reinterpret_cast<char *>(&fm.ip) + 0, &ip_int_be, sizeof(uint32_t));
+					std::memcpy(reinterpret_cast<char *>(&fm.ip) + 4, &ip_ext_be, sizeof(uint32_t));
 
-					// const bool match_external =
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
-					// const bool match_external =
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
-					// const bool wanted =
-					// 	is_new ||
-					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
-					const uint32_t internal_ip_host = internal_ip;
-					const uint32_t internal_ip_net = htonl(internal_ip);
+					// Match internal code
+					// const uint32_t internal_ip_host = internal_ip;
+					// const uint32_t internal_ip_net = htonl(internal_ip);
 
-					const bool match_internal =
-						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_net) != allowed_ips.end()) ||
-						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_host) != allowed_ips.end());
+					// const bool match_internal =
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_net) != allowed_ips.end()) ||
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_host) != allowed_ips.end());
 
-					const bool wanted = is_new || match_internal;
-					// const bool wanted = is_new || match_external;
+					// const bool wanted = is_new || match_internal;
+
+					// Match external code
+					const uint32_t external_ip_host = ext_pair.first;
+					const uint32_t external_ip_net = htonl(external_ip_host);
+					const bool match_external =
+						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
+						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
+
+					const bool wanted = is_new || match_external;
 
 #ifdef DEBUG
-					std::cout << "Finding internal ip " << internal_ip << std::endl;
+					// std::cout << "Finding internal ip " << internal_ip_host << std::endl;
+					std::cout << "Finding external ip " << external_ip_host << std::endl;
 #endif
 					if (wanted)
 						local_flows.emplace_back(fm);

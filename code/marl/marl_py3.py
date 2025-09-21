@@ -100,6 +100,7 @@ def tee_process_stdout(proc, prefix: str):
 # On-wire/request
 _SZ_U32_BE       = struct.Struct("!I")   # count
 _IP_U32_BE       = struct.Struct("!I")   # IPs we send
+_IP_U32_NATIVE   = struct.Struct("=I")   # IPs we receive (native)
 
 # Reply header/counters (native on your build)
 _TIME_I64_NATIVE = struct.Struct("=q")
@@ -108,6 +109,8 @@ _U64_NATIVE      = struct.Struct("=Q")
 # FlowMeasurement head (80 bytes native): q, 6Q, 6f
 _FM_HEAD_NATIVE  = struct.Struct("=q6Q6f")
 _FM_SIZE         = 88  # 80 + ip:u32 + pad4
+
+INTERNAL_IP_BE = struct.unpack("!I", socket.inet_aton("10.0.0.1"))[0]
 
 def _read_exact(sock, nbytes: int, deadline: float) -> bytes:
     buf = bytearray()
@@ -1511,7 +1514,7 @@ def marlExperiment(
                     # count: !I, each ip: !I
                     send_socket.sendall(_SZ_U32_BE.pack(len(flows_be)))
                     if flows_be:
-                        send_socket.sendall(b"".join(_IP_U32_BE.pack(x & 0xffffffff) for x in flows_be))
+                        send_socket.sendall(b"".join(_IP_U32_NATIVE.pack(x & 0xffffffff) for x in flows_be))
 
                     # -------------------------
                     # 2) REPLY HEADER (native)
@@ -1534,7 +1537,7 @@ def marlExperiment(
                     #   n_entries: !I (network)
                     #   records: n_entries * 88B
                     #   FlowMeasurement head (80B): =q6Q6f (native)
-                    #   FlowMeasurement.ip (4B):   =I     (native)   <-- key line
+                    #   FlowMeasurement.ip (4B):   !I     (native)   <-- key line
                     per_agent = [[] for _ in range(n_agents)]
                     for if_idx in range(n_ifs):
                         raw = _read_exact(send_socket, 4, agent_deadline)
@@ -1552,8 +1555,9 @@ def marlExperiment(
                             rec  = _read_exact(send_socket, _FM_SIZE, agent_deadline)
                             head = _FM_HEAD_NATIVE.unpack(rec[:_FM_HEAD_NATIVE.size])
                             # ip field: next 4 bytes; big-endian (network order) from C++
-                            (ip_be,) = struct.unpack("!I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
-                            if ip_be == 0:
+                            # (ip_be,) = struct.unpack("!I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
+                            ip_int_be, ip_ext_be = struct.unpack("!II", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+8])
+                            if ip_int_be == 0:
                                 continue
 
                             fl_len = head[0]
@@ -1568,7 +1572,7 @@ def marlExperiment(
                                 pout_mean, pout_var, pkt_out_cnt,
                                 iat_mean, iat_var
                             )
-                            flows_here.append((ip_be, props))
+                            flows_here.append((ip_ext_be, props))
 
                         agent_idx = if_to_agent[if_idx]
                         if agent_idx is not None and 0 <= agent_idx < n_agents:
@@ -2122,9 +2126,9 @@ def marlExperiment(
                                     action_narrowing=None if not allow_action_narrowing else narrowing_in_use[1],
                                     update_narrowing=None if not allow_update_narrowing else narrowing_in_use[1],
                                 )
-                                if isinstance(ip_pair[1], (int, np.integer)) and ip_pair[1] == 167772161:
-                                    LOG.debug("dst %s -> %s", ip_pair[1],
-                                                socket.inet_ntoa(struct.pack('!I', int(ip_pair[1]))))
+                                # if isinstance(ip_pair[1], (int, np.integer)) and ip_pair[1] == 167772161:
+                                #     LOG.debug("dst %s -> %s", ip_pair[1],
+                                #                 socket.inet_ntoa(struct.pack('!I', int(ip_pair[1]))))
 
                             else:
                                 (would_choose, new_vals, z_vec) = s.bootstrap(state)
@@ -2158,9 +2162,12 @@ def marlExperiment(
                         src_ip_int, dst_ip_int = ip_pair[0], ip_pair[1]
                         pred_bad = (allow_prob < allow_threshold)
 
+                        # truth_flag = truth_bad_map.get(src_ip_int, None)
                         truth_flag = truth_bad_map.get(src_ip_int, None)
                         if truth_flag is not None:
-                            last_pred_bad[src_ip_int] = pred_bad  # used for end-of-episode scoring
+                            last_pred_bad[src_ip_int] = pred_bad  # score by external/destination host
+                        else:
+                            LOG.warning("no truth for dst %s", socket.inet_ntoa(struct.pack('!I', int(src_ip_int))))
 
                         if action_fp is not None:
                             src_s = int_to_ip(src_ip_int)        # was inet_ntoa(struct.pack("I", ...))
