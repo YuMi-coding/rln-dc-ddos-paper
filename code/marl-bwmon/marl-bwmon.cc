@@ -924,10 +924,18 @@ static void perPacketHandle(u_char *user, const struct pcap_pkthdr *h, const u_c
 	uint32_t internal_ip = outbound ? src_ip_h : dst_ip_h;
 	uint32_t external_ip = outbound ? dst_ip_h : src_ip_h;
 
-	// If you want the first octet reliably:
-	auto first_octet = (external_ip >> 24) & 0xFF; // now correct after ntohl()
-	bool good = !(first_octet % 2);
+	// If you want the last octet reliably:
+	auto last_octet = (external_ip) & 0xFF; // now correct after ntohl()
+	bool good = !(last_octet % 2);
 
+#ifdef DEBUG
+	char ext_str[INET_ADDRSTRLEN];
+	in_addr tmp{external_ip};
+	inet_ntop(AF_INET, &tmp, ext_str, sizeof(ext_str));
+	std::cerr << "[mark] ext=" << ext_str
+			  << " last=" << int(last_octet)
+			  << " good=" << good << "\n";
+#endif
 	// #ifdef DEBUG
 	// 	std::cout << "Tracing a packet with  " << src_ip_h << "->" << dst_ip_h << std::endl
 	// 			  << "This src is local " << outbound << std::endl
