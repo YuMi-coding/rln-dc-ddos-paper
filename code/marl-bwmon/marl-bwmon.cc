@@ -602,21 +602,29 @@ public:
 					// const bool wanted =
 					// 	is_new ||
 					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
-					const uint32_t external_ip = ext_pair.first;  // outer_map key
-					const uint32_t external_ip_net = external_ip; // already network order if that is how stored
-					const uint32_t external_ip_host = ntohl(external_ip);
-					fm.ip = htonl(ext_pair.first);
+					// const uint32_t external_ip = ext_pair.first;  // outer_map key
+					// const uint32_t external_ip_net = external_ip; // already network order if that is how stored
+					// const uint32_t external_ip_host = ntohl(external_ip);
+					fm.ip = htonl(internal_ip);
 
 					// const bool match_external =
 					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
 					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
-					const bool match_external =
-						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
-						(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
+					// const bool match_external =
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_net) != allowed_ips.end()) ||
+					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), external_ip_host) != allowed_ips.end());
 					// const bool wanted =
 					// 	is_new ||
 					// 	(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip) != allowed_ips.end());
-					const bool wanted = is_new || match_external;
+					const uint32_t internal_ip_host = internal_ip;
+					const uint32_t internal_ip_net = htonl(internal_ip);
+
+					const bool match_internal =
+						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_net) != allowed_ips.end()) ||
+						(std::find(allowed_ips.begin(), allowed_ips.end(), internal_ip_host) != allowed_ips.end());
+
+					const bool wanted = is_new || match_internal;
+					// const bool wanted = is_new || match_external;
 
 #ifdef DEBUG
 					std::cout << "Finding internal ip " << internal_ip << std::endl;

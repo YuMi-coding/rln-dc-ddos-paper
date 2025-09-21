@@ -1551,15 +1551,10 @@ def marlExperiment(
                         for _ in range(n_entries):
                             rec  = _read_exact(send_socket, _FM_SIZE, agent_deadline)
                             head = _FM_HEAD_NATIVE.unpack(rec[:_FM_HEAD_NATIVE.size])
-                            # C++ sends the struct in native endianness → read ip with =I
-                            (ip_u32_native,) = struct.unpack("=I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
-                            if ip_u32_native == 0:
+                            # ip field: next 4 bytes; big-endian (network order) from C++
+                            (ip_be,) = struct.unpack("!I", rec[_FM_HEAD_NATIVE.size:_FM_HEAD_NATIVE.size+4])
+                            if ip_be == 0:
                                 continue
-
-                            # We store/print using big-endian *bytes* (dotted string uses network order).
-                            # ip_be_to_str expects the integer value and packs with !I internally,
-                            # so keeping the numeric here is fine.
-                            ip_val = ip_u32_native  # keep as numeric; ip_be_to_str() prints it correctly
 
                             fl_len = head[0]
                             size_in, size_out, d_in, d_out = head[1], head[2], head[3], head[4]
@@ -1573,7 +1568,7 @@ def marlExperiment(
                                 pout_mean, pout_var, pkt_out_cnt,
                                 iat_mean, iat_var
                             )
-                            flows_here.append((ip_val, props))
+                            flows_here.append((ip_be, props))
 
                         agent_idx = if_to_agent[if_idx]
                         if agent_idx is not None and 0 <= agent_idx < n_agents:
