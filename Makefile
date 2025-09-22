@@ -1,4 +1,4 @@
-.PHONY: setup x11-cookie ryu ryu-fg ryu-stop ryu-restart ryu-attach ryu-status tree marl clean
+.PHONY: setup x11-cookie ryu ryu-fg ryu-stop ryu-restart ryu-attach ryu-status tree marl run clean
 
 # Paths
 VENV_BIN := .venv/bin
@@ -15,6 +15,8 @@ RYU_APP  := code/marl/controller_py3.py
 MARL_DIR := code/marl
 MARL_APP := marl_py3.py
 MARL_ARGS ?= --episodes 1 --episode-length 200 --cli post           # you can override on the CLI, e.g.: MARL_ARGS='--episodes 1'
+APP ?= marl_py3.py # you can override on the CLI, e.g.: APP=other_script.py
+APP_ARGS ?= --episodes 1 --episode-length 200 --cli post
 
 setup:
 	bash cloudlab/setup-cloudlab.sh
@@ -106,6 +108,16 @@ ryu-attach:
 
 ryu-status:
 	@tmux ls || true
+
+# NEW: run any experiment files at the MARL directory
+run:
+	@echo "==> Cleaning Mininet state (ok if it errors)"
+	- sudo mn -c
+	@echo "==> Running MARL experiment ($(MARL_DIR)/$(APP)) with venv Python: $(VENV_PY)"
+	cd $(MARL_DIR) && sudo -E env PYTHONUNBUFFERED=1 \
+		PYTHONPATH="$(SYS_SITE):/usr/local/lib/python$(PYV)/dist-packages:$$PYTHONPATH" \
+		$(abspath $(VENV_PY)) -u $(APP) $(APP_ARGS)
+
 
 tree:
 	@echo "==> Cleaning Mininet state (ok if it errors)"

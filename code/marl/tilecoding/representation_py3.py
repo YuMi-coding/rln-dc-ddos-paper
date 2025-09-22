@@ -342,9 +342,9 @@ class TileCoding(Projector):
                  bias_term: bool = True):
         super().__init__()
 
-        # Require either explicit offsets or a random stream to generate them
+        # Either supply explicit offsets per tiling set, or a RNG to make them
         if offsets is None and rnd_stream is None:
-            raise Exception('Either offsets for each tiling or a random stream (numpy) must be provided.')
+            raise Exception("Either offsets for each tiling or a random stream (numpy) must be provided.")
 
         if hashing is None:
             hashing = [None] * len(ntilings)
@@ -352,45 +352,52 @@ class TileCoding(Projector):
             offsets = [None] * len(input_indices)
 
         self.state_range = np.array(state_range, dtype=object)
+
+        # Build each tiling set
         self.tilings = [
             Tiling(in_index, nt, t, self.state_range, rnd_stream, offset=o, hashing=h)
             for in_index, nt, t, h, o in zip(input_indices, ntiles, ntilings, hashing, offsets)
         ]
 
-        sizes = [t.size for t in self.tilings]
-        self.__size = int(sum(sizes))
+        # Per-set sizes (each set contributes ntilings[i] columns; each column has hashing.memory bins)
+        sizes = [t.size for t in self.tilings]                       # size of each tiling set
+        self._size_pre_bias = int(sum(sizes))                        # features before bias
         self.bias_term = bool(bias_term)
 
-        # Offset array for concatenating the index spaces of tilings
+        # Base offset per *tiling set* in the concatenated feature space
         base_offsets = np.zeros(len(ntilings), dtype=int)
         if len(self.tilings) > 1:
             base_offsets[1:] = np.cumsum(sizes[:-1], dtype=int)
-        # Repeat each base offset by its tiling count
+
+        # Expand: repeat each base offset by its *tiling count* (no bias here!)
         self.index_offset = np.hstack([
             np.full(tcount, off, dtype=int) for off, tcount in zip(base_offsets, ntilings)
-        ])
+        ])  # shape = (sum(ntilings),)
 
-        if self.bias_term:
-            self.index_offset = np.hstack((self.index_offset, np.array(self.__size, dtype=int)))
-            self.__size += 1
-
-        self.__size = int(self.__size)
+        # Final size (append a single bias column if requested)
+        self.__size = self._size_pre_bias + (1 if self.bias_term else 0)
+        self._bias_index = self._size_pre_bias  # remember the id of the bias column
 
     def __call__(self, state: np.ndarray) -> np.ndarray:
+        # Accept (D,) or (N, D)
         if state.ndim == 1:
             state = state.reshape((1, -1))
 
+        # Concatenate indices from every tiling set (columns) → shape (N, sum(ntilings))
+        indices = np.hstack([t(state) for t in self.tilings]).astype(int)
+
+        # Shift each column block by its global offset
+        indices = indices + self.index_offset[None, :]
+
+        # Append a single bias column at the end, if enabled
         if self.bias_term:
-            parts = [t(state) for t in self.tilings]
-            if hasattr(self, "extra_tilings") and self.extra_tilings is not None:
-                parts.append(self.extra_tilings(state))
+            bias_col = np.full((indices.shape[0], 1), self._bias_index, dtype=int)
+            indices = np.hstack((indices, bias_col))
 
-            # Shape we want: (batch, n_tilings, n_dims)
-            indices = np.stack(parts, axis=1)
-        else:
-            indices = np.hstack([t(state) for t in self.tilings]) + self.index_offset
-
+        # Return (sum(ntilings) [+1]) for a single row, else (N, …)
         return indices.squeeze()
+
+
 
     @property
     def size(self) -> int:

@@ -183,8 +183,8 @@ def send_ctl(action_obj: Dict[str, Any], port: int = controller_build_port + 1) 
         _send_len_prefixed(s, data)
         resp = s.recv(4)
         status = struct.unpack("!I", resp)[0] if len(resp) == 4 else 0
-        if status != 0:
-            LOG.warning("[ctl<-] status=%d op=%s", status, action_obj.get("op"))
+        if status not in (0, 1):
+            LOG.warning("[ctl<-] status=%d op=%s for %s", status, action_obj.get("op"), action_obj)
         else:
             LOG.debug("[ctl<-] status=%d op=%s", status, action_obj.get("op"))
         return status
@@ -580,8 +580,9 @@ def marlExperiment(
         flow_pdrop_msg[0] = {"op": "flow_write_actions", "payload": {
             "priority": 1,
             "match": {"eth_type": 0x0800, "ipv4_dst": {"value": ip, "mask": subnet}},
-            "actions": [{"type": "PDROP_LEGACY", "pnum": 0xffffffff},
-                        {"type": "OUTPUT", "port": out_port}]
+            # "actions": [{"type": "PDROP_LEGACY", "pnum": 0xffffffff},
+            #             {"type": "OUTPUT", "port": out_port}]
+            "actions": [{"type": "OUTPUT", "port": out_port}]
         }}
 
         flow_arp_upcall[0] = {"op": "flow_write_actions", "payload": {
@@ -693,8 +694,9 @@ def marlExperiment(
         ac = default_machine.action()
         if spiffy_but_bad:
             ac = 0.0
-        p_drop_num = pdrop(1 - ac)
-        local_gselect_msg = [internal_choose_group(0, force_old=p_drop_num)]
+        # p_drop_num = pdrop(1 - ac)
+        # local_gselect_msg = [internal_choose_group(0, force_old=p_drop_num)]
+        local_gselect_msg = [internal_choose_group(0)]
         for msg in flow_group_msgs[0] + local_gselect_msg + [flow_outbound_msg[0]]:
             if alive: updateOneRoute(switch, cmd_list, msg)
             else: route_commands[0].append((switch, cmd_list, msg))
@@ -736,12 +738,12 @@ def marlExperiment(
             # Forward: src -> dst
             msg_fwd = internal_choose_group(
                 group_idx, ip=dst_str, target_ip=src_str, subnet="255.255.255.255",
-                force_old=group_idx  # legacy path: controller attaches METER+NORMAL
+                # force_old=group_idx  # legacy path: controller attaches METER+NORMAL
             )
             # Reverse: dst -> src
             msg_rev = internal_choose_group(
                 group_idx, ip=src_str, target_ip=dst_str, subnet="255.255.255.255",
-                force_old=group_idx
+                # force_old=group_idx
             )
             LOG.debug("[ctl] sw=%s set BIDIR GROUP=%d (allow=%.3f) src=%s ↔ dst=%s",
                      dbg_sw, group_idx, float(ac_prob), src_str, dst_str)
@@ -1693,34 +1695,34 @@ def marlExperiment(
                     sms = [submodel]
                 else:
                     sms = [m["submodel"] for (p, m) in mix_model]
-            for sm in sms:
-                if sm in (None, "http"):
-                    fname = f"temp{i}.conf"
-                    with open("../traffic-host/" + fname, "w") as f:
-                        f.write(
-                            "events { worker_connections 1024; }\n"
-                            "http {\n"
-                            f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
-                            "}\n"
-                        )
-                    cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
+                for sm in sms:
+                    if sm in (None, "http"):
+                        fname = f"temp{i}.conf"
+                        with open("../traffic-host/" + fname, "w") as f:
+                            f.write(
+                                "events { worker_connections 1024; }\n"
+                                "http {\n"
+                                f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
+                                "}\n"
+                            )
+                        cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
 
-                elif sm == "opus-voip":   # <<< was `submodel == "opus-voip"`
-                    cmd = ["../opus-voip-traffic/target/release/opus-voip-traffic", "--server"]
+                    elif sm == "opus-voip":   # <<< was `submodel == "opus-voip"`
+                        cmd = ["../opus-voip-traffic/target/release/opus-voip-traffic", "--server"]
 
-                else:
-                    # default to nginx/http if unknown submodel to avoid UnboundLocalError
-                    fname = f"temp{i}.conf"
-                    with open("../traffic-host/" + fname, "w") as f:
-                        f.write(
-                            "events { worker_connections 1024; }\n"
-                            "http {\n"
-                            f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
-                            "}\n"
-                        )
-                    cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
+                    else:
+                        # default to nginx/http if unknown submodel to avoid UnboundLocalError
+                        fname = f"temp{i}.conf"
+                        with open("../traffic-host/" + fname, "w") as f:
+                            f.write(
+                                "events { worker_connections 1024; }\n"
+                                "http {\n"
+                                f"\tserver {{\n\t\tinclude global.conf;\n\t\tlisten {dest_node[0][0]}:80;\n\t}}\n"
+                                "}\n"
+                            )
+                        cmd = ["nginx", "-p", "../traffic-host", "-c", fname]
 
-                cmds.append(cmd)
+                    cmds.append(cmd)
                 for cmd in cmds:
                     server_procs.append(dest.popen(cmd, stdin=PIPE, stderr=sys.stderr))
                     tee_process_stdout(server_procs[-1], f"[srv{dest_node[0][0]}] ")
@@ -1817,8 +1819,8 @@ def marlExperiment(
                             action = machine.action()
                         a = action if override_action is None else override_action
                         tx_ac = sarsa.actions[a] if isinstance(a, (int, int)) else a
-                        LOG.debug("[act] ep=%d step=%d learner=%d sw=%s (global) allow=%.3f group=%d",
-                                 ep, i, learner_no, node.name, float(tx_ac),
+                        LOG.debug("[act] ep=%d step=%d sw=%s (global) allow=%.3f group=%d",
+                                 ep, i, node.name, float(tx_ac),
                                  pdrop_prob_to_group_idx(float(tx_ac)))
                         updateUpstreamRoute(node, ac_prob=tx_ac)
             else:
@@ -2258,6 +2260,11 @@ def marlExperiment(
             LOG.debug("bwmon socket cleanup failed", exc_info=True)
 
         mon_cmd.stdin.close()
+        # Close BWMON process
+        try:
+            mon_cmd.terminate()
+        except Exception:
+            pass
 
         # Close monitor reporter
         try:
@@ -2353,6 +2360,7 @@ if __name__ == "__main__":
     marlExperiment(
         model="nginx",
         submodel="http",
+        rf = "marl",
         use_controller=True,
         episodes=args.episodes,
         episode_length=args.episode_length,

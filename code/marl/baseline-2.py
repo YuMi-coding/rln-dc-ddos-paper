@@ -1,4 +1,4 @@
-from marl import *
+from marl_py3 import *
 from writer import writeResults, makeResultsAverage
 
 results = marlExperiment(
