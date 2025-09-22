@@ -130,6 +130,7 @@ def _read_exact(sock, nbytes: int, deadline: float) -> bytes:
 def _ip_be_to_str(u32_be: int) -> str:
     return socket.inet_ntoa(struct.pack("!I", u32_be & 0xffffffff))
 
+
 def _connect_unix(path, retries=12, init_delay=0.02, max_delay=0.25, timeout=2.0):
     """
     Connect to a UNIX domain socket with a short retry/backoff.
@@ -181,7 +182,12 @@ def send_ctl(action_obj: Dict[str, Any], port: int = controller_build_port + 1) 
         data = json.dumps(action_obj).encode("utf-8")
         _send_len_prefixed(s, data)
         resp = s.recv(4)
-        return struct.unpack("!I", resp)[0] if len(resp) == 4 else 0
+        status = struct.unpack("!I", resp)[0] if len(resp) == 4 else 0
+        if status != 0:
+            LOG.warning("[ctl<-] status=%d op=%s", status, action_obj.get("op"))
+        else:
+            LOG.debug("[ctl<-] status=%d op=%s", status, action_obj.get("op"))
+        return status
 
 def ip_to_int(ip_str: str) -> int:
     return struct.unpack("!I", socket.inet_aton(ip_str))[0]
@@ -510,21 +516,36 @@ def marlExperiment(
         # original code treated ac_prob as allow probability
         idx = int(prob_allow * num_drop_groups)
         return max(0, min(num_drop_groups - 1, idx))
+    def log_action_event(ep: int, step: int, learner: int, sw: str,
+                        src_ip_be: int, dst_ip_be: int, allow_prob: float) -> None:
+        """
+        Structured, one-line summary of the action we just took.
+        """
+        try:
+            grp = pdrop_prob_to_group_idx(float(allow_prob))
+        except Exception:
+            grp = -1
+        LOG.info(
+            "[act] ep=%d step=%d learner=%d sw=%s src=%s dst=%s allow=%.3f group=%d",
+            ep, step, learner, sw,
+            _ip_be_to_str(src_ip_be), _ip_be_to_str(dst_ip_be),
+            float(allow_prob), int(grp)
+        )
 
     def internal_choose_group(group: int, ip="10.0.0.1", subnet="255.255.255.0",
-                              target_ip=None, force_old=None) -> Dict[str, Any]:
+                            target_ip=None, force_old=None) -> Dict[str, Any]:
         payload = {
-            "ensure_groups": [{
+            "ensure_groups": [{  # harmless if you stick to legacy path; keeps meters in sync
                 "group_id": i,
                 "type": "INDIRECT",
-                # Controller will set PDROP internally; we pass desired probability per group by index
                 "actions": [{"type": "PDROP", "group_index": i},
                             {"type": "OUTPUT", "port": "NORMAL"}]
             } for i in range(num_drop_groups)],
             "flow": {
                 "priority": 1 if target_ip is None else 2,
+                "table": 1,  # <— send rules where your table-0 goto points to
                 "match": {"eth_type": 0x0800, "ipv4_dst": {"value": ip, "mask": subnet}},
-                "actions": [{"type": "GROUP", "group_id": group}]
+                "actions": [{"type": "GROUP", "group_id": group}]  # overwritten by legacy below
             }
         }
         if target_ip is not None:
@@ -704,22 +725,34 @@ def marlExperiment(
     def updateUpstreamRoute(switch, out_port=1, ac_prob=0.0, target_ip=None):
         if switch.controlled: return
         group_idx = pdrop_prob_to_group_idx(ac_prob)
-        # if target_ip is not None:
-        #     (src, dst) = target_ip
-        #     msg = internal_choose_group(group_idx, ip=dst, target_ip=src, subnet="255.255.255.255")
-        # else:
-        #     msg = internal_choose_group(group_idx)
+        # ---- NEW: human-friendly log of exactly what we’re about to program
+        dbg_sw = getattr(switch, "name", "<sw>")
         if target_ip is not None:
             (src, dst) = target_ip
             # ensure dotted strings
             src_str = src if isinstance(src, str) else int_to_ip(src)
             dst_str = dst if isinstance(dst, str) else int_to_ip(dst)
-            msg = internal_choose_group(group_idx, ip=dst_str, target_ip=src_str, subnet="255.255.255.255")
-        else:
-            msg = internal_choose_group(group_idx)
-        cmd_list = []
-        if alive: updateOneRoute(switch, cmd_list, msg)
-        else: route_commands[0].append((switch, cmd_list, msg))
+
+            # Forward: src -> dst
+            msg_fwd = internal_choose_group(
+                group_idx, ip=dst_str, target_ip=src_str, subnet="255.255.255.255",
+                force_old=group_idx  # legacy path: controller attaches METER+NORMAL
+            )
+            # Reverse: dst -> src
+            msg_rev = internal_choose_group(
+                group_idx, ip=src_str, target_ip=dst_str, subnet="255.255.255.255",
+                force_old=group_idx
+            )
+            LOG.debug("[ctl] sw=%s set BIDIR GROUP=%d (allow=%.3f) src=%s ↔ dst=%s",
+                     dbg_sw, group_idx, float(ac_prob), src_str, dst_str)
+            cmd_list = []
+            if alive:
+                updateOneRoute(switch, cmd_list, msg_fwd)
+                updateOneRoute(switch, cmd_list, msg_rev)
+            else:
+                route_commands[0].append((switch, cmd_list, msg_fwd))
+                route_commands[0].append((switch, cmd_list, msg_rev))
+        return
 
     def switch_cmd(switch, cmd_list, msg, needs_check=False):
         if alive: updateOneRoute(switch, cmd_list, msg, needs_check)
@@ -1503,6 +1536,10 @@ def marlExperiment(
                         agent_deadline: float = 5.0):
 
                 flows_be = list(flows_be)
+                VICTIM_IP_BE = struct.unpack("!I", socket.inet_aton("10.0.0.1"))[0]
+                if VICTIM_IP_BE not in flows_be:
+                    flows_be.append(VICTIM_IP_BE)
+                flows_be = list(set(flows_be))  # deduplicate
 
                 def _one_round(send_socket):
                     LOG.debug("[bwmon] ask_stats: query_size=%d", len(flows_be))
@@ -1572,7 +1609,7 @@ def marlExperiment(
                                 pout_mean, pout_var, pkt_out_cnt,
                                 iat_mean, iat_var
                             )
-                            flows_here.append((ip_ext_be, props))
+                            flows_here.append((ip_int_be, ip_ext_be, props))
 
                         agent_idx = if_to_agent[if_idx]
                         if agent_idx is not None and 0 <= agent_idx < n_agents:
@@ -1780,6 +1817,9 @@ def marlExperiment(
                             action = machine.action()
                         a = action if override_action is None else override_action
                         tx_ac = sarsa.actions[a] if isinstance(a, (int, int)) else a
+                        LOG.debug("[act] ep=%d step=%d learner=%d sw=%s (global) allow=%.3f group=%d",
+                                 ep, i, learner_no, node.name, float(tx_ac),
+                                 pdrop_prob_to_group_idx(float(tx_ac)))
                         updateUpstreamRoute(node, ac_prob=tx_ac)
             else:
                 curr_time = time.time()
@@ -1973,30 +2013,9 @@ def marlExperiment(
                     norm_flows = []
                     if flows_seen:
                         sample = flows_seen[0]
-                        # Socketed path returns (src_ip_int, props_tuple)
-                        if isinstance(sample, tuple) and len(sample) == 2 and not isinstance(sample[1], dict):
-                            # Build once: list of candidate destination IPs (as native ints in network order)
-                            dest_ip_list = list(dest_from_ip.keys())  # ["10.0.0.1", "10.0.0.2", ...]
-                            dest_ip_ints = [struct.unpack("!I", socket.inet_aton(x))[0] for x in dest_ip_list]
-
-                            def _pick_dst_for_src(src_ip_int: int) -> int:
-                                """Stable per-flow dst pick:
-                                - single-destination: trivial
-                                - multi-destination: use the same hash you use for path selection
-                                """
-                                if len(dest_ip_ints) == 1:
-                                    return dest_ip_ints[0]
-                                mac = host_ip_mac_map.get(src_ip_int, "00:00:00:00:00:00")
-                                idx = hash_fn(len(dest_ip_ints), src_ip_int, 0, mac)
-                                return dest_ip_ints[idx]
-
-                            for (src_ip_int, props_tuple) in flows_seen:
-                                dst_ip_int = _pick_dst_for_src(src_ip_int)
-                                if src_ip_int == dst_ip_int and len(dest_ip_ints) > 1:
-                                    # extremely rare; re-roll with a different seed to avoid src==dst
-                                    mac = host_ip_mac_map.get(src_ip_int, "00:00:00:00:00:00")
-                                    idx2 = (hash_fn(len(dest_ip_ints), src_ip_int, 1, mac)) % len(dest_ip_ints)
-                                    dst_ip_int = dest_ip_ints[idx2]
+                        # Socketed path returns (src_ip_be, dst_ip_be, props_tuple)
+                        if isinstance(sample, tuple) and len(sample) == 3:
+                            for (src_ip_int, dst_ip_int, props_tuple) in flows_seen:
                                 norm_flows.append((src_ip_int, dst_ip_int, props_tuple))
                         else:
                             # Legacy/non-socketed path: list of (src_ip_int, {dst_ip_str: props_tuple, ...})
@@ -2004,6 +2023,7 @@ def marlExperiment(
                                 for (dst_ip_str, props_tuple) in props_dict.items():
                                     dst_ip_int = struct.unpack("!I", socket.inet_aton(dst_ip_str))[0]
                                     norm_flows.append((src_ip_int, dst_ip_int, props_tuple))
+
 
                     total_spent = 0.0
                     def can_act(): return trs_maxtime is None or total_spent <= trs_maxtime
@@ -2155,6 +2175,10 @@ def marlExperiment(
 
                         # APPLY action to switch for that (src,dst) pair:
                         tx_ac = machine.action() if isinstance(l_action, (int, int)) else l_action
+                        # one-line human log of the action we’re about to apply
+                        if i % 50 == 0:
+                            log_action_event(ep, i, learner_no, vertex_map[node_label].name,
+                                            ip_pair[0], ip_pair[1], float(tx_ac))
                         updateUpstreamRoute(node, ac_prob=tx_ac, target_ip=ip_pair)
 
                         # --- NEW: log decision and update per-host "last prediction" ---
@@ -2162,12 +2186,11 @@ def marlExperiment(
                         src_ip_int, dst_ip_int = ip_pair[0], ip_pair[1]
                         pred_bad = (allow_prob < allow_threshold)
 
-                        # truth_flag = truth_bad_map.get(src_ip_int, None)
-                        truth_flag = truth_bad_map.get(src_ip_int, None)
+                        truth_flag = truth_bad_map.get(dst_ip_int, None)   # <— dst, not src
                         if truth_flag is not None:
-                            last_pred_bad[src_ip_int] = pred_bad  # score by external/destination host
+                            last_pred_bad[dst_ip_int] = pred_bad           # keyed by destination host
                         else:
-                            LOG.warning("no truth for dst %s", socket.inet_ntoa(struct.pack('!I', int(src_ip_int))))
+                            LOG.warning("no truth for dst %s", int_to_ip(dst_ip_int))
 
                         if action_fp is not None:
                             src_s = int_to_ip(src_ip_int)        # was inet_ntoa(struct.pack("I", ...))

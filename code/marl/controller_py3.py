@@ -16,7 +16,7 @@ from ryu.controller.ofp_event import EventOFPStateChange
 from ryu.ofproto import ofproto_v1_3 as ofp
 from ryu.ofproto import ofproto_v1_3_parser as parser
 from ryu.lib.packet import packet, ethernet, arp
-import socket, struct, threading, json, pickle
+import socket, struct, threading, json, pickle, numbers, os, time, logging, logging.handlers
 
 BUILD_PORT = 6666
 ACT_PORT   = BUILD_PORT + 1
@@ -38,6 +38,32 @@ class RLNController(app_manager.RyuApp):
         # start two threads: bootstrap (pickle) and action server (json)
         threading.Thread(target=self._bootstrap_listener, daemon=True).start()
         threading.Thread(target=self._action_listener, daemon=True).start()
+        # ---- file logging setup (adds rotating file handler, keeps console) ----
+        # Log directory (override with env RLN_LOG_DIR if you like)
+        log_dir = os.environ.get("RLN_LOG_DIR", os.path.join(os.path.dirname(__file__), "logs"))
+        os.makedirs(log_dir, exist_ok=True)
+        # Timestamped log filename
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"controller_{ts}.log")
+
+        # Avoid duplicate handlers if Ryu/parent set some; keep existing console if present
+        # Only add our file handler once
+        if not any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
+            fh = logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            )
+            fmt = logging.Formatter(
+                "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            fh.setFormatter(fmt)
+            fh.setLevel(os.environ.get("RLN_LOG_LEVEL", "INFO"))
+            self.logger.addHandler(fh)
+
+        # Set overall level & stop propagation to root to prevent duplicate lines
+        self.logger.setLevel(os.environ.get("RLN_LOG_LEVEL", "INFO"))
+        self.logger.propagate = False
+        self.logger.info("Controller file logging to %s", log_path)
 
     @set_ev_cls(EventOFPStateChange)
     def _state_change(self, ev):
@@ -72,6 +98,7 @@ class RLNController(app_manager.RyuApp):
             dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=ofp.OFP_NO_BUFFER,
                                             in_port=msg.match.get('in_port', ofp.OFPP_CONTROLLER),
                                             actions=actions, data=msg.data))
+
     def _add_base_flows(self, dp):
         # ARP: flood (priority 10)
         match = parser.OFPMatch(eth_type=0x0806)
@@ -79,29 +106,18 @@ class RLNController(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=10, match=match, instructions=inst))
 
-        # IPv4: normal L2 switching (priority 1)
+        # IPv4: hand off to table 1 (priority 100)
+        match = parser.OFPMatch(eth_type=0x0800)
+        inst = [parser.OFPInstructionGotoTable(1)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=0, priority=100, match=match, instructions=inst))
+
+        # Table-1 fallback: NORMAL (priority 0)
         match = parser.OFPMatch(eth_type=0x0800)
         actions = [parser.OFPActionOutput(ofp.OFPP_NORMAL)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=1, match=match, instructions=inst))
-    # def _bootstrap_listener(self):
-    #     # same as your code: accept pickle once
-    #     s = socket.socket()
-    #     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    #     s.bind(("127.0.0.1", BUILD_PORT))
-    #     s.listen(1)
-    #     conn, _ = s.accept()
-    #     try:
-    #         # read length (uint64) then blob
-    #         length = struct.unpack("!Q", conn.recv(8))[0]
-    #         buf = b""
-    #         while len(buf) < length:
-    #             buf += conn.recv(min(65536, length-len(buf)))
-    #         (self.entry_map, self.escape_map, self.inner_host_macs,
-    #          self.prevent_smart, self.port_dest_map) = pickle.loads(buf)
-    #     finally:
-    #         conn.close()
-    #         s.close()
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=1, priority=0, match=match, instructions=inst))
+
+
 
     def _ensure_meter(self, dp, meter_id, kbps):
         # Drop all above kbps (approximate pdrop via rate shaping)
@@ -112,6 +128,7 @@ class RLNController(app_manager.RyuApp):
                                 meter_id=meter_id,
                                 bands=bands)
         try:
+            self.logger.debug("METER dpid=%s id=%d kbps=%d", dp.id, meter_id, kbps)
             dp.send_msg(mod)
         except Exception:
             # If it already exists, you might need to modify (OFPMC_MODIFY); keep it simple for now.
@@ -176,26 +193,47 @@ class RLNController(app_manager.RyuApp):
             length = struct.unpack("!I", self._recv_exact(c, 4))[0]
             blob = self._recv_exact(c, length)
             req = json.loads(blob.decode("utf-8"))
-            dpid = int(req.get("dpid"))
-            dp = self.datapaths.get(dpid)
-            
-            if not dp:
-                c.sendall(struct.pack("!I", 1)); c.close(); return
+            dpid_req = req.get("dpid")
             op = req.get("op"); payload = req.get("payload", {})
-            if op == "ensure_group_and_flow":
-                self._ensure_groups(dp, payload.get("ensure_groups", []))
-                self._flow_write_actions(dp, payload["flow"])
-            elif op == "ensure_group":
-                self._ensure_groups(dp, [payload])
-            elif op == "flow_write_actions":
-                self._flow_write_actions(dp, payload)
-            elif op == "goto_table":
-                # optional, if you use tables
-                pass
-            elif op == "rewrite_src_to_controller":
-                self._rewrite_src_to_controller(dp, payload)
+
+            # choose target datapaths
+            targets = []
+            if dpid_req is None:
+                targets = list(self.datapaths.values())  # broadcast
+            else:
+                try:
+                    dp = self.datapaths.get(int(dpid_req))
+                    if dp: targets = [dp]
+                except Exception:
+                    pass
+
+            if not targets:
+                self.logger.warning("RPC %s dropped: no target datapaths (dpid=%r)", op, dpid_req)
+                c.sendall(struct.pack("!I", 1)); c.close(); return
+
+            # apply op to each target
+            for dp in targets:
+                self.logger.debug("RPC %s -> dpid=%s payload=%s", op, dp.id, str(payload)[:200])
+                if op == "ensure_group_and_flow":
+                    self._ensure_groups(dp, payload.get("ensure_groups", []))
+                    self._flow_write_actions(dp, payload["flow"])
+                elif op == "ensure_group":
+                    self._ensure_groups(dp, [payload])
+                elif op == "flow_write_actions":
+                    self._flow_write_actions(dp, payload)
+                elif op == "goto_table":
+                    fro = int(payload.get("from", 0))
+                    to  = int(payload.get("to", 1))
+                    match = parser.OFPMatch(eth_type=0x0800)
+                    inst  = [parser.OFPInstructionGotoTable(table_id=to)]
+                    dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=fro, priority=100,
+                                                match=match, instructions=inst))
+                elif op == "rewrite_src_to_controller":
+                    self._rewrite_src_to_controller(dp, payload)
+
             c.sendall(struct.pack("!I", 0))
         except Exception as e:
+            self.logger.exception("RPC handling error: %s", str(e))
             try: c.sendall(struct.pack("!I", 2))
             except: pass
         finally:
@@ -220,34 +258,6 @@ class RLNController(app_manager.RyuApp):
             # Allow allow_p * NOMINAL, drop rest
             self._ensure_meter(dp, meter_id=1000 + gid, kbps=int(NOMINAL_KBPS * allow_p))
 
-    # def _flow_write_actions(self, dp, spec):
-    #     prio = spec.get("priority", 1)
-    #     table = spec.get("table", 0)
-    #     match = self._match_from_spec(spec.get("match", {}))
-    #     actions = self._actions_from_spec(dp, spec.get("actions", []))
-    #     inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-    #     dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=table, priority=prio,
-    #                                   match=match, instructions=inst, idle_timeout=30))
-
-    def _flow_write_actions(self, dp, spec):
-        meter_id = getattr(self, "_pending_meter_id", None)
-        if meter_id is not None:
-            inst.insert(0, parser.OFPInstructionMeter(meter_id))
-            self._pending_meter_id = None
-
-        prio = spec.get("priority", 1)
-        table = spec.get("table", 0)
-        match = self._match_from_spec(spec.get("match", {}))
-        actions = self._actions_from_spec(dp, spec.get("actions", []))
-        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        # If actions included a PDROP_LEGACY pnum or a group index, attach a meter
-        meter_id = spec.get("meter_id")
-        if meter_id is not None:
-            inst.insert(0, parser.OFPInstructionMeter(meter_id))
-        dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=table, priority=prio,
-                                    match=match, instructions=inst, idle_timeout=30))
-
-
     def _rewrite_src_to_controller(self, dp, spec):
         prio = spec.get("priority", 1)
         match = self._match_from_spec(spec.get("match", {}))
@@ -260,22 +270,43 @@ class RLNController(app_manager.RyuApp):
         dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=prio, match=match, instructions=inst,
                                       idle_timeout=30))
 
+
     def _match_from_spec(self, m):
         kw = {}
-        if "eth_type" in m: kw["eth_type"] = int(m["eth_type"])
-        def ipk(field):
+
+        # Simple fields we support right now
+        if "eth_type" in m:
+            kw["eth_type"] = int(m["eth_type"])
+        if "arp_op" in m:
+            kw["arp_op"] = int(m["arp_op"])
+
+        def _norm_ip(v):
+            # Accept dotted-quad string or integer. If int, assume network-order u32.
+            if isinstance(v, numbers.Integral):
+                return socket.inet_ntoa(struct.pack("!I", int(v)))
+            return v  # assume dotted-quad string
+
+        # Helper to pull value/mask for ipv4_src/dst
+        def _pull(field):
+            if field not in m:
+                return
             v = m[field]
             if isinstance(v, dict):
-                return (v["value"], v.get("mask", None))
-            return (v, None)
-        if "ipv4_src" in m:
-            val, mask = ipk("ipv4_src")
-            if mask: kw["ipv4_src_masked"] = (val, mask)
-            else:    kw["ipv4_src"] = val
-        if "ipv4_dst" in m:
-            val, mask = ipk("ipv4_dst")
-            if mask: kw["ipv4_dst_masked"] = (val, mask)
-            else:    kw["ipv4_dst"] = val
+                val = _norm_ip(v.get("value"))
+                mask = v.get("mask")
+                if mask is not None:
+                    kw[field] = (val, mask)   # <-- masked form (tuple) on the normal field name
+                else:
+                    kw[field] = val
+            else:
+                kw[field] = _norm_ip(v)
+
+        _pull("ipv4_src")
+        _pull("ipv4_dst")
+
+        # handy for debugging bad specs
+        self.logger.debug("OFPMatch kw=%s (from spec=%s)", kw, m)
+
         return parser.OFPMatch(**kw)
 
     # def _actions_from_spec(self, dp, acts):
@@ -299,23 +330,44 @@ class RLNController(app_manager.RyuApp):
 
     def _actions_from_spec(self, dp, acts):
         out = []
-        # default: None; filled if we see PDROP/PDROP_LEGACY
+        # default: None; will be filled if we see PDROP/PDROP_LEGACY/GROUP
         self._pending_meter_id = None
         for a in acts:
             t = a["type"]
             if t == "OUTPUT":
-                ...
+                port = a["port"]
+                if port == "CONTROLLER":
+                    out.append(parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER))
+                elif port == "FLOOD":
+                    out.append(parser.OFPActionOutput(ofp.OFPP_FLOOD))
+                elif port == "NORMAL":
+                    out.append(parser.OFPActionOutput(ofp.OFPP_NORMAL))
+                else:
+                    out.append(parser.OFPActionOutput(int(port)))
             elif t == "GROUP":
-                out.append(parser.OFPActionGroup(a["group_id"]))
-                # If your group_id encodes prob group, also meter on same id:
-                gid = a["group_id"]
-                self._pending_meter_id = 1000 + int(gid)
+                gid = int(a["group_id"])
+                out.append(parser.OFPActionGroup(gid))
+                # piggyback: meter id 1000+gid for drop shaping
+                self._pending_meter_id = 1000 + gid
             elif t == "PDROP":
-                gid = a.get("group_index", 0)
-                self._pending_meter_id = 1000 + int(gid)
+                gid = int(a.get("group_index", 0))
+                self._pending_meter_id = 1000 + gid
             elif t == "PDROP_LEGACY":
-                # Map 0xffffffff..0x0 to ~[0..1] allowance; keep a coarse mapping
-                pnum = int(a.get("pnum", 0xffffffff))
-                gid = int(round((pnum / 0xffffffff) * 19))  # 20 groups
+                gid = int(a.get("pnum", 0))
                 self._pending_meter_id = 1000 + gid
         return out
+
+
+    def _flow_write_actions(self, dp, spec):
+        prio  = int(spec.get("priority", 1))
+        table = int(spec.get("table", 0))
+        match = self._match_from_spec(spec.get("match", {}))
+        actions = self._actions_from_spec(dp, spec.get("actions", []))
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        pend = getattr(self, "_pending_meter_id", None)
+        if pend is not None:
+            inst.insert(0, parser.OFPInstructionMeter(pend))
+            self._pending_meter_id = None
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, table_id=table, priority=prio,
+                                    match=match, instructions=inst, idle_timeout=30))
+
