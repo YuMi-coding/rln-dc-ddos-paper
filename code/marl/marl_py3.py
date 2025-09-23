@@ -1569,7 +1569,19 @@ def marlExperiment(
 
                     def mbps(u64bytes): return 8000.0 * float(u64bytes) / float(time_ns)
                     unfused_load_mbps = [(mbps(goods[j]), mbps(bads[j])) for j in range(2*n_ifs)]
-
+                    # --- NEW: compute a global observed Mbps to scale rewards ---
+                    # Sum (good + bad) over all monitored directions/interfaces.
+                    observed_mbps = 0.0
+                    for g, b in unfused_load_mbps:
+                        observed_mbps += float(g) + float(b)
+                    # Fallback: avoid div-by-zero
+                    try:
+                        ratio_local = max(0.0, min(1.0, observed_mbps / float(bw_all[2])))
+                    except Exception:
+                        ratio_local = 1.0
+                    # cache latest ratio for the training loop
+                    nonlocal ratio
+                    ratio = ratio_local
                     # -------------------------
                     # 3) PER-INTERFACE FLOW BLOCKS
                     # For each interface:
@@ -1770,7 +1782,7 @@ def marlExperiment(
 
         time.sleep(3)
 
-        ratio = 1.0
+        ratio = 1.0 # Default ratio if we don't get data from bwmon
         if with_ratio and not bw_mon_socketed:
             mon_cmd.stdin.write(b"\n"); mon_cmd.stdin.flush()
             data = mon_cmd.stdout.readline().strip().decode().split(",")
@@ -2360,7 +2372,7 @@ if __name__ == "__main__":
     marlExperiment(
         model="nginx",
         submodel="http",
-        rf = "marl",
+        rf = "ctl",
         use_controller=True,
         episodes=args.episodes,
         episode_length=args.episode_length,
@@ -2373,13 +2385,15 @@ if __name__ == "__main__":
         unix_sock=True,
 
         explore_episodes = 10,
-        separate_episodes = True,
+        separate_episodes = False, # NOTE: If separated, agents are new in each episode and do not share learning
 
         alpha = 0.05,
         epsilon = 0.2,
-        discount = 0,
+        discount = 0.9,
 
-        dt = 0.05,#0.01,
+        dt = 0.05,#0.01,	
+        override_action = 0.0,
+        manual_early_limit = 26.0,
 
         log_dir=args.log_dir,
     )
