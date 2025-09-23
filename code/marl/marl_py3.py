@@ -310,7 +310,7 @@ def marlExperiment(
     ecmp_servers: int = 8,
     ecmp_k: int = 4,
 
-    explore_episodes: int = 80000,
+    explore_episodes = 80000,
     episodes: int = 1000,
     episode_length: int = 5000,
     separate_episodes: bool = False,
@@ -2371,5 +2371,15 @@ if __name__ == "__main__":
         log_actions=True,
         allow_threshold=0.5,
         unix_sock=True,
+
+        explore_episodes = 10,
+        separate_episodes = True,
+
+        alpha = 0.05,
+        epsilon = 0.2,
+        discount = 0,
+
+        dt = 0.05,#0.01,
+
         log_dir=args.log_dir,
     )

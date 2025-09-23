@@ -60,19 +60,31 @@ def sym_tiling_index(
 
 
 class Theano_IdentityHash(object):
+    """
+    Identity/cartesian-product hash that exactly matches the Py2 behavior.
+
+    Given per-dimension integer indices (N, D, T), it linearizes the D
+    dimensions in row-major order and returns (N, T) int32 indices. The
+    'memory' equals np.prod(dims).
+    """
     def __init__(self, dims):
+        # Keep Py2 semantics: dims can be a list/array; memory is the cartesian size
         self.dims = np.asarray(dims, dtype=int)
-        self.memory = int(np.prod(self.dims))
+        self.memory = int(np.prod(self.dims))  # same as Py2
+        # nothing else needed; multipliers are built in getHashedFunction
 
     def getHashedFunction(self, indices):
         """
-        Linearizes multi-dim indices (cartesian product) in row-major order.
-        indices: (N, D, T)
+        indices: Theano tensor of shape (N, D, T) with integer tile indices.
+
+        Returns: Theano int32 tensor of shape (N, T) with linearized indices.
         """
-        # multipliers for each dimension (row-major)
-        dims = np.cumprod(np.hstack(([1], self.dims[::-1][:-1])), dtype=int)[::-1]
-        dims = dims[None, None, :]  # shape (1, 1, D)
-        return T.sum(indices * T.cast(dims, "int32"), axis=1, keepdims=False)
+        # Exact Py2 formulation:
+        # dims = np.cumprod(np.hstack(([1], self.dims[:0:-1]))).astype('int')[None, ::-1, None]
+        dims = np.cumprod(np.hstack(([1], self.dims[:0:-1]))).astype("int")[None, ::-1, None]
+        dims_t = T.cast(dims, "int32")  # broadcast shape (1, D, 1)
+        return T.sum(indices * dims_t, axis=1, keepdims=False)
+
 
 
 class Theano_UNH(object):
